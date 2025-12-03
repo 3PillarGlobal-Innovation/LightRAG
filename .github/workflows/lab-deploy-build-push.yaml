@@ -3,8 +3,8 @@ name: innovation-lab-build-push
 on:
   push:
     branches:
-      # - main
-      - ci-pipeline
+      - main
+      # - ci-pipeline
       # - ' '
   workflow_dispatch: 
 
