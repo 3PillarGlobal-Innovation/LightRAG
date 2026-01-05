@@ -1089,7 +1089,9 @@ class LightRAG:
             # Generate contents dict of MD5 hash IDs and documents with paths
             # Include file path in ID generation to ensure different files get different IDs
             contents = {
-                compute_mdhash_id(f"{content}\0{path}", prefix="doc-"): {
+                compute_mdhash_id(
+                    f"{content}\n{path}", prefix="doc-"
+                ): {
                     "content": content,
                     "file_path": path,
                 }
