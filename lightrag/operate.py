@@ -2612,19 +2612,27 @@ async def _get_vector_context(
 
         # Perform vector search first, then filter by document IDs
         if query_param.ids:
-            logger.info(f"[CHUNK FILTERING] Filtering chunks by document IDs: {query_param.ids}")
-            logger.debug(f"[CHUNK FILTERING] Performing vector search then filtering by full_doc_id")
+            logger.info(
+                f"[CHUNK FILTERING] Filtering chunks by document IDs: {query_param.ids}"
+            )
+            logger.debug(
+                "[CHUNK FILTERING] Performing vector search then filtering by full_doc_id"
+            )
         else:
-            logger.debug(f"[CHUNK FILTERING] Performing normal vector search (no document ID filter)")
-        
+            logger.debug(
+                "[CHUNK FILTERING] Performing normal vector search (no document ID filter)"
+            )
+
         # Always use query method - get_by_ids() expects chunk IDs, not document IDs
         results = await chunks_vdb.query(
             query, top_k=search_top_k, query_embedding=query_embedding
         )
-        
+
         if query_param.ids and results:
-            logger.info(f"[CHUNK FILTERING] Retrieved {len(results)} chunks, now filtering by document IDs")
-        
+            logger.info(
+                f"[CHUNK FILTERING] Retrieved {len(results)} chunks, now filtering by document IDs"
+            )
+
         if not results:
             logger.info(
                 f"Naive query: 0 chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
@@ -2633,22 +2641,28 @@ async def _get_vector_context(
 
         valid_chunks = []
         logger.debug(f"[CHUNK FILTERING] Processing {len(results)} chunk results")
-        
+
         for i, result in enumerate(results):
             if "content" in result:
                 chunk_id = result.get("id", f"chunk_{i}")
                 full_doc_id = result.get("full_doc_id", "unknown")
-                
+
                 # Apply document ID filtering if specified
                 if query_param.ids:
-                    logger.debug(f"[CHUNK FILTERING] Chunk '{chunk_id}' belongs to document '{full_doc_id}'")
-                    
+                    logger.debug(
+                        f"[CHUNK FILTERING] Chunk '{chunk_id}' belongs to document '{full_doc_id}'"
+                    )
+
                     if full_doc_id and full_doc_id in query_param.ids:
-                        logger.debug(f"[CHUNK FILTERING] ✅ Chunk '{chunk_id}' included (doc '{full_doc_id}' in target list)")
+                        logger.debug(
+                            f"[CHUNK FILTERING] ✅ Chunk '{chunk_id}' included (doc '{full_doc_id}' in target list)"
+                        )
                     else:
-                        logger.debug(f"[CHUNK FILTERING] ❌ Chunk '{chunk_id}' excluded (doc '{full_doc_id}' not in target list)")
+                        logger.debug(
+                            f"[CHUNK FILTERING] ❌ Chunk '{chunk_id}' excluded (doc '{full_doc_id}' not in target list)"
+                        )
                         continue
-                
+
                 chunk_with_metadata = {
                     "content": result["content"],
                     "created_at": result.get("created_at", None),
@@ -2658,13 +2672,19 @@ async def _get_vector_context(
                     "full_doc_id": full_doc_id,  # Include document ID for reference
                 }
                 valid_chunks.append(chunk_with_metadata)
-                logger.debug(f"[CHUNK FILTERING] Added chunk '{chunk_id}' to valid chunks")
+                logger.debug(
+                    f"[CHUNK FILTERING] Added chunk '{chunk_id}' to valid chunks"
+                )
             else:
-                logger.debug(f"[CHUNK FILTERING] Skipping result {i} - no content field")
+                logger.debug(
+                    f"[CHUNK FILTERING] Skipping result {i} - no content field"
+                )
 
         if query_param.ids:
-            logger.info(f"[CHUNK FILTERING] Document ID filtering: {len(valid_chunks)} chunks remain from {len(results)} original chunks")
-        
+            logger.info(
+                f"[CHUNK FILTERING] Document ID filtering: {len(valid_chunks)} chunks remain from {len(results)} original chunks"
+            )
+
         logger.info(
             f"Naive query: {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
         )
@@ -2688,11 +2708,19 @@ async def _perform_kg_search(
 ) -> dict[str, Any]:
     # Document filtering debug information
     if query_param.ids:
-        logger.info(f"🎯 [DOCUMENT FILTER] Starting search with document ID filtering: {query_param.ids}")
-        logger.info(f"🎯 [DOCUMENT FILTER] Query mode: {query_param.mode}, top_k: {query_param.top_k}")
-        logger.info(f"🎯 [DOCUMENT FILTER] Keywords - Low level: {ll_keywords}, High level: {hl_keywords}")
+        logger.info(
+            f"🎯 [DOCUMENT FILTER] Starting search with document ID filtering: {query_param.ids}"
+        )
+        logger.info(
+            f"🎯 [DOCUMENT FILTER] Query mode: {query_param.mode}, top_k: {query_param.top_k}"
+        )
+        logger.info(
+            f"🎯 [DOCUMENT FILTER] Keywords - Low level: {ll_keywords}, High level: {hl_keywords}"
+        )
     else:
-        logger.debug(f"[SEARCH] Starting search without document filtering - mode: {query_param.mode}")
+        logger.debug(
+            f"[SEARCH] Starting search without document filtering - mode: {query_param.mode}"
+        )
     """
     Pure search logic that retrieves raw entities, relations, and vector chunks.
     No token truncation or formatting - just raw search results.
@@ -3295,10 +3323,12 @@ async def _build_llm_context(
     logger.debug(
         f"[_build_llm_context] Converting to user format: {len(entities_context)} entities, {len(relations_context)} relations, {len(truncated_chunks)} chunks"
     )
-    logger.debug(f"[_build_llm_context] Reference list being passed: {len(reference_list)} items")
+    logger.debug(
+        f"[_build_llm_context] Reference list being passed: {len(reference_list)} items"
+    )
     for i, ref in enumerate(reference_list):
         logger.debug(f"[_build_llm_context]   Reference {i+1}: {ref}")
-    
+
     final_data = convert_to_user_format(
         entities_context,
         relations_context,
@@ -3311,8 +3341,10 @@ async def _build_llm_context(
     logger.debug(
         f"[_build_llm_context] Final data after conversion: {len(final_data.get('entities', []))} entities, {len(final_data.get('relationships', []))} relationships, {len(final_data.get('chunks', []))} chunks"
     )
-    logger.debug(f"[_build_llm_context] Final data references: {len(final_data.get('data', {}).get('references', []))} items")
-    for i, ref in enumerate(final_data.get('data', {}).get('references', [])):
+    logger.debug(
+        f"[_build_llm_context] Final data references: {len(final_data.get('data', {}).get('references', []))} items"
+    )
+    for i, ref in enumerate(final_data.get("data", {}).get("references", [])):
         logger.debug(f"[_build_llm_context]   Final reference {i+1}: {ref}")
     return result, final_data
 
@@ -3450,83 +3482,123 @@ async def _get_node_data(
 
     # Apply document ID filtering for entity search
     if query_param.ids and results and text_chunks_db:
-        logger.info(f"Filtering {len(results)} entities by document IDs: {query_param.ids}")
+        logger.info(
+            f"Filtering {len(results)} entities by document IDs: {query_param.ids}"
+        )
         from lightrag.base import GRAPH_FIELD_SEP
-        
+
         # Create a set for faster lookup
         target_doc_ids = set(query_param.ids)
         filtered_results = []
-        
+
         for i, result in enumerate(results):
             entity_name = result.get("entity_name", "unknown")
             source_id = result.get("source_id", "")
             entity_matches_filter = False
-            
-            logger.debug(f"[Entity {i+1}/{len(results)}] Processing entity '{entity_name}' with source_id: {source_id[:100]}...")
-            
+
+            logger.debug(
+                f"[Entity {i+1}/{len(results)}] Processing entity '{entity_name}' with source_id: {source_id[:100]}..."
+            )
+
             if source_id:
                 # Extract chunk IDs from source_id (they're separated by GRAPH_FIELD_SEP)
-                chunk_ids = source_id.split(GRAPH_FIELD_SEP) if GRAPH_FIELD_SEP in source_id else [source_id]
-                logger.debug(f"[Entity '{entity_name}'] Extracted {len(chunk_ids)} chunk IDs: {chunk_ids[:3]}...")
-                
+                chunk_ids = (
+                    source_id.split(GRAPH_FIELD_SEP)
+                    if GRAPH_FIELD_SEP in source_id
+                    else [source_id]
+                )
+                logger.debug(
+                    f"[Entity '{entity_name}'] Extracted {len(chunk_ids)} chunk IDs: {chunk_ids[:3]}..."
+                )
+
                 try:
                     # Look up actual chunks to get their document IDs
                     chunk_lookup_list = chunk_ids[:10]  # Limit for performance
-                    logger.debug(f"[Entity '{entity_name}'] Looking up {len(chunk_lookup_list)} chunks for document mapping")
-                    
+                    logger.debug(
+                        f"[Entity '{entity_name}'] Looking up {len(chunk_lookup_list)} chunks for document mapping"
+                    )
+
                     chunk_data_list = await text_chunks_db.get_by_ids(chunk_lookup_list)
-                    logger.debug(f"[Entity '{entity_name}'] Retrieved {len([c for c in chunk_data_list if c])} valid chunk records")
-                    
+                    logger.debug(
+                        f"[Entity '{entity_name}'] Retrieved {len([c for c in chunk_data_list if c])} valid chunk records"
+                    )
+
                     for j, chunk_data in enumerate(chunk_data_list):
                         if chunk_data and isinstance(chunk_data, dict):
                             full_doc_id = chunk_data.get("full_doc_id", "")
                             chunk_id = chunk_data.get("id", f"chunk_{j}")
-                            logger.debug(f"[Entity '{entity_name}'] Chunk '{chunk_id}' belongs to document '{full_doc_id}'")
-                            
+                            logger.debug(
+                                f"[Entity '{entity_name}'] Chunk '{chunk_id}' belongs to document '{full_doc_id}'"
+                            )
+
                             if full_doc_id in target_doc_ids:
-                                logger.info(f"[Entity '{entity_name}'] ✅ MATCH FOUND! Document '{full_doc_id}' in target list")
+                                logger.info(
+                                    f"[Entity '{entity_name}'] ✅ MATCH FOUND! Document '{full_doc_id}' in target list"
+                                )
                                 entity_matches_filter = True
                                 break
                         else:
-                            logger.debug(f"[Entity '{entity_name}'] Chunk {j} is None or invalid")
-                    
+                            logger.debug(
+                                f"[Entity '{entity_name}'] Chunk {j} is None or invalid"
+                            )
+
                     # Fallback: Check if document ID appears in file_path or source_id
                     if not entity_matches_filter:
-                        logger.debug(f"[Entity '{entity_name}'] No direct chunk matches, trying fallback heuristic")
+                        logger.debug(
+                            f"[Entity '{entity_name}'] No direct chunk matches, trying fallback heuristic"
+                        )
                         file_path = result.get("file_path", "")
-                        logger.debug(f"[Entity '{entity_name}'] Checking file_path: '{file_path}' and source_id for document ID patterns")
-                        
+                        logger.debug(
+                            f"[Entity '{entity_name}'] Checking file_path: '{file_path}' and source_id for document ID patterns"
+                        )
+
                         for doc_id in target_doc_ids:
                             if doc_id in file_path or doc_id in source_id:
-                                logger.info(f"[Entity '{entity_name}'] ✅ FALLBACK MATCH! Document '{doc_id}' found in metadata")
+                                logger.info(
+                                    f"[Entity '{entity_name}'] ✅ FALLBACK MATCH! Document '{doc_id}' found in metadata"
+                                )
                                 entity_matches_filter = True
                                 break
-                        
+
                         if not entity_matches_filter:
-                            logger.debug(f"[Entity '{entity_name}'] ❌ No matches found in fallback check")
-                                
+                            logger.debug(
+                                f"[Entity '{entity_name}'] ❌ No matches found in fallback check"
+                            )
+
                 except Exception as e:
-                    logger.warning(f"[Entity '{entity_name}'] ⚠️ Error during chunk lookup: {e}")
-                    logger.debug(f"[Entity '{entity_name}'] Falling back to simple heuristic check")
+                    logger.warning(
+                        f"[Entity '{entity_name}'] ⚠️ Error during chunk lookup: {e}"
+                    )
+                    logger.debug(
+                        f"[Entity '{entity_name}'] Falling back to simple heuristic check"
+                    )
                     # Fallback to simple heuristic
                     file_path = result.get("file_path", "")
                     for doc_id in target_doc_ids:
                         if doc_id in file_path or doc_id in source_id:
-                            logger.info(f"[Entity '{entity_name}'] ✅ EXCEPTION FALLBACK MATCH! Document '{doc_id}' found")
+                            logger.info(
+                                f"[Entity '{entity_name}'] ✅ EXCEPTION FALLBACK MATCH! Document '{doc_id}' found"
+                            )
                             entity_matches_filter = True
                             break
             else:
                 # If no source_id, include entity (fallback for manual entries)
-                logger.debug(f"[Entity '{entity_name}'] No source_id found, including entity (manual entry)")
+                logger.debug(
+                    f"[Entity '{entity_name}'] No source_id found, including entity (manual entry)"
+                )
                 entity_matches_filter = True
-            
+
             if entity_matches_filter:
-                logger.debug(f"[Entity '{entity_name}'] ✅ INCLUDED in filtered results")
+                logger.debug(
+                    f"[Entity '{entity_name}'] ✅ INCLUDED in filtered results"
+                )
                 filtered_results.append(result)
             else:
                 logger.debug(f"[Entity '{entity_name}'] ❌ EXCLUDED from results")
-        
-        logger.info(f"Entity filtering: {len(filtered_results)} entities remain after document ID filter")
+
+        logger.info(
+            f"Entity filtering: {len(filtered_results)} entities remain after document ID filter"
+        )
         results = filtered_results
 
     if not len(results):
@@ -3806,88 +3878,135 @@ async def _get_edge_data(
 
     # Apply document ID filtering for relationship search
     if query_param.ids and text_chunks_db:
-        logger.info(f"[RELATIONSHIP FILTERING] Filtering relationships by document IDs: {query_param.ids}")
+        logger.info(
+            f"[RELATIONSHIP FILTERING] Filtering relationships by document IDs: {query_param.ids}"
+        )
         results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
-        logger.debug(f"[RELATIONSHIP FILTERING] Retrieved {len(results)} relationships before filtering")
-        
+        logger.debug(
+            f"[RELATIONSHIP FILTERING] Retrieved {len(results)} relationships before filtering"
+        )
+
         # Filter results to only include relationships from specified documents
         from lightrag.base import GRAPH_FIELD_SEP
+
         target_doc_ids = set(query_param.ids)
         filtered_results = []
-        
+
         for i, result in enumerate(results):
             src_id = result.get("src_id", "unknown")
             tgt_id = result.get("tgt_id", "unknown")
             source_id = result.get("source_id", "")
-            
-            logger.debug(f"[RELATIONSHIP FILTERING] Processing relationship '{src_id}'-'{tgt_id}' with source_id: {source_id[:100]}...")
-            
+
+            logger.debug(
+                f"[RELATIONSHIP FILTERING] Processing relationship '{src_id}'-'{tgt_id}' with source_id: {source_id[:100]}..."
+            )
+
             relationship_matches_filter = False
             if source_id:
                 # Extract chunk IDs from source_id (they're separated by GRAPH_FIELD_SEP)
-                chunk_ids = source_id.split(GRAPH_FIELD_SEP) if GRAPH_FIELD_SEP in source_id else [source_id]
-                logger.debug(f"[RELATIONSHIP FILTERING] Extracted {len(chunk_ids)} chunk IDs: {chunk_ids[:3]}...")
-                
+                chunk_ids = (
+                    source_id.split(GRAPH_FIELD_SEP)
+                    if GRAPH_FIELD_SEP in source_id
+                    else [source_id]
+                )
+                logger.debug(
+                    f"[RELATIONSHIP FILTERING] Extracted {len(chunk_ids)} chunk IDs: {chunk_ids[:3]}..."
+                )
+
                 try:
                     # Look up actual chunks to get their document IDs
                     chunk_lookup_list = chunk_ids[:10]  # Limit for performance
-                    logger.debug(f"[RELATIONSHIP FILTERING] Looking up {len(chunk_lookup_list)} chunks for document mapping")
-                    
+                    logger.debug(
+                        f"[RELATIONSHIP FILTERING] Looking up {len(chunk_lookup_list)} chunks for document mapping"
+                    )
+
                     chunk_data_list = await text_chunks_db.get_by_ids(chunk_lookup_list)
-                    logger.debug(f"[RELATIONSHIP FILTERING] Retrieved {len([c for c in chunk_data_list if c])} valid chunk records")
-                    
+                    logger.debug(
+                        f"[RELATIONSHIP FILTERING] Retrieved {len([c for c in chunk_data_list if c])} valid chunk records"
+                    )
+
                     for j, chunk_data in enumerate(chunk_data_list):
                         if chunk_data and isinstance(chunk_data, dict):
                             full_doc_id = chunk_data.get("full_doc_id", "")
                             chunk_id = chunk_data.get("id", f"chunk_{j}")
-                            logger.debug(f"[RELATIONSHIP FILTERING] Chunk '{chunk_id}' belongs to document '{full_doc_id}'")
-                            
+                            logger.debug(
+                                f"[RELATIONSHIP FILTERING] Chunk '{chunk_id}' belongs to document '{full_doc_id}'"
+                            )
+
                             if full_doc_id in target_doc_ids:
-                                logger.info(f"[RELATIONSHIP FILTERING] ✅ MATCH FOUND! Relationship '{src_id}'-'{tgt_id}' via document '{full_doc_id}'")
+                                logger.info(
+                                    f"[RELATIONSHIP FILTERING] ✅ MATCH FOUND! Relationship '{src_id}'-'{tgt_id}' via document '{full_doc_id}'"
+                                )
                                 relationship_matches_filter = True
                                 break
                         else:
-                            logger.debug(f"[RELATIONSHIP FILTERING] Chunk {j} is None or invalid")
-                    
+                            logger.debug(
+                                f"[RELATIONSHIP FILTERING] Chunk {j} is None or invalid"
+                            )
+
                     # Fallback: Check if document ID appears in file_path or source_id
                     if not relationship_matches_filter:
-                        logger.debug(f"[RELATIONSHIP FILTERING] No direct chunk matches, trying fallback heuristic")
+                        logger.debug(
+                            "[RELATIONSHIP FILTERING] No direct chunk matches, trying fallback heuristic"
+                        )
                         file_path = result.get("file_path", "")
-                        logger.debug(f"[RELATIONSHIP FILTERING] Checking file_path: '{file_path}' and source_id for document ID patterns")
-                        
+                        logger.debug(
+                            f"[RELATIONSHIP FILTERING] Checking file_path: '{file_path}' and source_id for document ID patterns"
+                        )
+
                         for doc_id in target_doc_ids:
                             if doc_id in file_path or doc_id in source_id:
-                                logger.info(f"[RELATIONSHIP FILTERING] ✅ FALLBACK MATCH! Relationship '{src_id}'-'{tgt_id}' found document '{doc_id}' in metadata")
+                                logger.info(
+                                    f"[RELATIONSHIP FILTERING] ✅ FALLBACK MATCH! Relationship '{src_id}'-'{tgt_id}' found document '{doc_id}' in metadata"
+                                )
                                 relationship_matches_filter = True
                                 break
-                        
+
                         if not relationship_matches_filter:
-                            logger.debug(f"[RELATIONSHIP FILTERING] ❌ No matches found in fallback check for '{src_id}'-'{tgt_id}'")
-                            
+                            logger.debug(
+                                f"[RELATIONSHIP FILTERING] ❌ No matches found in fallback check for '{src_id}'-'{tgt_id}'"
+                            )
+
                 except Exception as e:
-                    logger.warning(f"[RELATIONSHIP FILTERING] ⚠️ Error during chunk lookup for relationship '{src_id}'-'{tgt_id}': {e}")
-                    logger.debug(f"[RELATIONSHIP FILTERING] Falling back to simple heuristic check")
+                    logger.warning(
+                        f"[RELATIONSHIP FILTERING] ⚠️ Error during chunk lookup for relationship '{src_id}'-'{tgt_id}': {e}"
+                    )
+                    logger.debug(
+                        "[RELATIONSHIP FILTERING] Falling back to simple heuristic check"
+                    )
                     # Fallback to simple heuristic
                     file_path = result.get("file_path", "")
                     for doc_id in target_doc_ids:
                         if doc_id in file_path or doc_id in source_id:
-                            logger.info(f"[RELATIONSHIP FILTERING] ✅ EXCEPTION FALLBACK MATCH! Relationship '{src_id}'-'{tgt_id}' found document '{doc_id}'")
+                            logger.info(
+                                f"[RELATIONSHIP FILTERING] ✅ EXCEPTION FALLBACK MATCH! Relationship '{src_id}'-'{tgt_id}' found document '{doc_id}'"
+                            )
                             relationship_matches_filter = True
                             break
             else:
-                logger.debug(f"[RELATIONSHIP FILTERING] No source_id for relationship '{src_id}'-'{tgt_id}', including by default")
+                logger.debug(
+                    f"[RELATIONSHIP FILTERING] No source_id for relationship '{src_id}'-'{tgt_id}', including by default"
+                )
                 relationship_matches_filter = True
-            
+
             if relationship_matches_filter:
-                logger.debug(f"[RELATIONSHIP FILTERING] ✅ INCLUDED relationship '{src_id}'-'{tgt_id}' in filtered results")
+                logger.debug(
+                    f"[RELATIONSHIP FILTERING] ✅ INCLUDED relationship '{src_id}'-'{tgt_id}' in filtered results"
+                )
                 filtered_results.append(result)
             else:
-                logger.debug(f"[RELATIONSHIP FILTERING] ❌ EXCLUDED relationship '{src_id}'-'{tgt_id}' from results")
-        
-        logger.info(f"[RELATIONSHIP FILTERING] Relationship filtering: {len(filtered_results)} relationships remain after document ID filter")
+                logger.debug(
+                    f"[RELATIONSHIP FILTERING] ❌ EXCLUDED relationship '{src_id}'-'{tgt_id}' from results"
+                )
+
+        logger.info(
+            f"[RELATIONSHIP FILTERING] Relationship filtering: {len(filtered_results)} relationships remain after document ID filter"
+        )
         results = filtered_results
     else:
-        logger.debug(f"[RELATIONSHIP FILTERING] No document ID filter applied, using all query results")
+        logger.debug(
+            "[RELATIONSHIP FILTERING] No document ID filter applied, using all query results"
+        )
         results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
 
     if not len(results):

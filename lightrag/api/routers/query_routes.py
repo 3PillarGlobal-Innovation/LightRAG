@@ -82,7 +82,6 @@ class QueryRequest(BaseModel):
         default=None, description="List of ids to filter the results."
     )
 
-
     user_prompt: Optional[str] = Field(
         default=None,
         description="User-provided prompt for the query. If provided, this will be used instead of the default value from prompt template.",
@@ -102,7 +101,7 @@ class QueryRequest(BaseModel):
         default=True,
         description="If True, enables streaming output for real-time responses. Only affects /query/stream endpoint.",
     )
-    
+
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:
@@ -353,10 +352,13 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # Debug logging to see what's in the result
             import logging
+
             logger = logging.getLogger("lightrag")
             logger.debug(f"[API] Result structure: {list(result.keys())}")
             logger.debug(f"[API] Result data section: {result.get('data', {}).keys()}")
-            logger.debug(f"[API] References in result: {result.get('data', {}).get('references', [])}")
+            logger.debug(
+                f"[API] References in result: {result.get('data', {}).get('references', [])}"
+            )
 
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})

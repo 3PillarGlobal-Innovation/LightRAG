@@ -24,8 +24,7 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       poc_network:
-  
+
 networks:
   poc_network:
     external: true
-    
