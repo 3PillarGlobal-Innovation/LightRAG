@@ -1075,19 +1075,25 @@ class LightRAG:
             }
         else:
             # Clean input text and remove duplicates in one pass
-            unique_content_with_paths = {}
+            # Note: We keep all files even if content is the same, as different files should have different IDs
+            unique_content_with_paths = []
+            seen = set()
             for doc, path in zip(input, file_paths):
                 cleaned_content = sanitize_text_for_encoding(doc)
-                if cleaned_content not in unique_content_with_paths:
-                    unique_content_with_paths[cleaned_content] = path
+                # Use (content, path) as key to allow same content from different files
+                key = (cleaned_content, path)
+                if key not in seen:
+                    seen.add(key)
+                    unique_content_with_paths.append((cleaned_content, path))
 
             # Generate contents dict of MD5 hash IDs and documents with paths
+            # Include file path in ID generation to ensure different files get different IDs
             contents = {
-                compute_mdhash_id(content, prefix="doc-"): {
+                compute_mdhash_id(f"{content}\0{path}", prefix="doc-"): {
                     "content": content,
                     "file_path": path,
                 }
-                for content, path in unique_content_with_paths.items()
+                for content, path in unique_content_with_paths
             }
 
         # 2. Generate document initial status (without content)
