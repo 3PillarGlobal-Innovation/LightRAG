@@ -6,12 +6,12 @@ on:
       - main
       # - ci-pipeline
       # - ' '
-  workflow_dispatch: 
+  workflow_dispatch:
 
 # Used for getting permissions to AWS resources through an OIDC federation
 permissions:
   id-token: write
-  contents: read  
+  contents: read
 
 env:
   AWS_REGION: us-east-1
@@ -21,7 +21,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:                       
+    steps:
       - name: 'Configure AWS credentials'
         uses: aws-actions/configure-aws-credentials@v1
         with:
@@ -30,7 +30,7 @@ jobs:
           role-duration-seconds: 3600
           aws-region: ${{ env.AWS_REGION }}
 
-      - uses: actions/checkout@v2                  
+      - uses: actions/checkout@v2
       - name: Login to ECR
         uses: docker/login-action@v2
         with:
@@ -43,7 +43,3 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{github.run_number}}
-
-
-
-

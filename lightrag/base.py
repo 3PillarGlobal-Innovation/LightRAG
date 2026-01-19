@@ -164,7 +164,7 @@ class QueryParam:
     """
 
     ids: list[str] | None = None
-    """List of document IDs to filter the query results. If provided, only chunks, entities, 
+    """List of document IDs to filter the query results. If provided, only chunks, entities,
     and relationships associated with these document IDs will be considered in the search results."""
 
     include_references: bool = False
