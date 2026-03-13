@@ -1171,7 +1171,7 @@ class PostgreSQLDB:
                         f"HNSW vector index {vector_index_name} already exists on table {k}"
                     )
             except Exception as e:
-                logger.error(f"Failed to create vector index on table {k}, Got: {e}")
+                logger.warning(f"Failed to create vector index on table {k}, Got: {e}")
 
     async def _create_ivfflat_vector_indexes(self):
         vdb_tables = [
