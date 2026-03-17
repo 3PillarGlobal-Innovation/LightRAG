@@ -86,6 +86,7 @@ from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import (
     Tokenizer,
     TiktokenTokenizer,
+    TokenTracker,
     EmbeddingFunc,
     always_get_an_event_loop,
     compute_mdhash_id,
@@ -1553,6 +1554,15 @@ class LightRAG:
                             # Record processing start time
                             processing_start_time = int(time.time())
 
+                            # Create token trackers for this document
+                            doc_llm_token_tracker = TokenTracker()
+                            doc_embedding_token_tracker = TokenTracker()
+
+                            # Set embedding tracker on embedding funcs for this document
+                            self.chunks_vdb.embedding_func.token_tracker = doc_embedding_token_tracker
+                            self.entities_vdb.embedding_func.token_tracker = doc_embedding_token_tracker
+                            self.relationships_vdb.embedding_func.token_tracker = doc_embedding_token_tracker
+
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
                             doc_status_task = asyncio.create_task(
@@ -1600,7 +1610,8 @@ class LightRAG:
                             # Stage 2: Process entity relation graph (after text_chunks are saved)
                             entity_relation_task = asyncio.create_task(
                                 self._process_extract_entities(
-                                    chunks, pipeline_status, pipeline_status_lock
+                                    chunks, pipeline_status, pipeline_status_lock,
+                                    token_tracker=doc_llm_token_tracker,
                                 )
                             )
                             await entity_relation_task
@@ -1625,6 +1636,11 @@ class LightRAG:
                             for task in all_tasks:
                                 if task and not task.done():
                                     task.cancel()
+
+                            # Clear embedding tracker from shared embedding funcs
+                            self.chunks_vdb.embedding_func.token_tracker = None
+                            self.entities_vdb.embedding_func.token_tracker = None
+                            self.relationships_vdb.embedding_func.token_tracker = None
 
                             # Persistent llm cache
                             if self.llm_response_cache:
@@ -1675,10 +1691,20 @@ class LightRAG:
                                     current_file_number=current_file_number,
                                     total_files=total_files,
                                     file_path=file_path,
+                                    token_tracker=doc_llm_token_tracker,
                                 )
 
                                 # Record processing end time
                                 processing_end_time = int(time.time())
+
+                                # Clear embedding tracker from shared embedding funcs
+                                self.chunks_vdb.embedding_func.token_tracker = None
+                                self.entities_vdb.embedding_func.token_tracker = None
+                                self.relationships_vdb.embedding_func.token_tracker = None
+
+                                # Collect token usage from document processing
+                                llm_token_usage = doc_llm_token_tracker.get_usage()
+                                embedding_token_usage = doc_embedding_token_tracker.get_usage()
 
                                 await self.doc_status.upsert(
                                     {
@@ -1697,6 +1723,10 @@ class LightRAG:
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
+                                                "llm_token_usage": llm_token_usage,
+                                                "embedding_token_usage": embedding_token_usage,
+                                                "llm_model_name": self.llm_model_name,
+                                                "embedding_model_name": os.environ.get("EMBEDDING_MODEL"),
                                             },
                                         }
                                     }
@@ -1810,7 +1840,8 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
     async def _process_extract_entities(
-        self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
+        self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None,
+        token_tracker=None,
     ) -> list:
         try:
             chunk_results = await extract_entities(
@@ -1820,6 +1851,7 @@ class LightRAG:
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.llm_response_cache,
                 text_chunks_storage=self.text_chunks,
+                token_tracker=token_tracker,
             )
             return chunk_results
         except Exception as e:
@@ -2427,6 +2459,10 @@ class LightRAG:
                 else None,
                 "is_streaming": query_result.is_streaming,
             }
+
+            # Attach token usage and model info for cost tracking
+            raw_data["token_usage"] = query_result.token_usage or {}
+            raw_data["model_name"] = self.llm_model_name
 
             return raw_data
 
