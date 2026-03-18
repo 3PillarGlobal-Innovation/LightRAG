@@ -2377,6 +2377,10 @@ class LightRAG:
 
         global_config = asdict(self)
 
+        # Track embedding token usage during query
+        query_embedding_token_tracker = TokenTracker()
+        self.embedding_func.__wrapped__.token_tracker = query_embedding_token_tracker
+
         try:
             query_result = None
 
@@ -2471,11 +2475,20 @@ class LightRAG:
                 "is_streaming": query_result.is_streaming,
             }
 
+            # Clear embedding tracker
+            self.embedding_func.__wrapped__.token_tracker = None
+
             # Attach token usage and model info for cost tracking
             raw_data["token_usage"] = query_result.token_usage or {}
+            raw_data["embedding_token_usage"] = (
+                query_embedding_token_tracker.get_usage()
+            )
             raw_data["model_name"] = (
                 os.environ.get("AZURE_OPENAI_DEPLOYMENT") or self.llm_model_name
             )
+            raw_data["embedding_model_name"] = os.environ.get(
+                "AZURE_EMBEDDING_DEPLOYMENT"
+            ) or os.environ.get("EMBEDDING_MODEL")
 
             return raw_data
 

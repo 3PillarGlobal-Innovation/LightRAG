@@ -222,13 +222,13 @@ class QdrantVectorDBStorage(BaseVectorStorage):
             )  # higher priority for query
             embedding = embedding_result[0]
 
-        results = self._client.search(
+        results = self._client.query_points(
             collection_name=self.final_namespace,
-            query_vector=embedding,
+            query=embedding,
             limit=top_k,
             with_payload=True,
             score_threshold=self.cosine_better_than_threshold,
-        )
+        ).points
 
         # logger.debug(f"[{self.workspace}] query result: {results}")
 
