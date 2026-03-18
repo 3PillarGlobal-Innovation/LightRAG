@@ -416,7 +416,7 @@ async def _handle_single_relationship_extraction(
     ):  # treat "relationship" and "relation" interchangeable
         if len(record_attributes) > 1 and "relation" in record_attributes[0]:
             logger.warning(
-                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) >2 else 'N/A'}`"
+                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
             )
             logger.debug(record_attributes)
         return None
@@ -2265,7 +2265,7 @@ async def extract_entities(
             await asyncio.wait(pending)
 
         # Add progress prefix to the exception message
-        progress_prefix = f"C[{processed_chunks+1}/{total_chunks}]"
+        progress_prefix = f"C[{processed_chunks + 1}/{total_chunks}]"
 
         # Re-raise the original exception with a prefix
         prefixed_exception = create_prefixed_exception(first_exception, progress_prefix)
@@ -2479,7 +2479,9 @@ async def kg_query(
                 .strip()
             )
 
-        return QueryResult(content=response, raw_data=context_result.raw_data, token_usage=token_usage)
+        return QueryResult(
+            content=response, raw_data=context_result.raw_data, token_usage=token_usage
+        )
     else:
         # Streaming response (AsyncIterator)
         return QueryResult(
@@ -3374,7 +3376,7 @@ async def _build_llm_context(
         f"[_build_llm_context] Reference list being passed: {len(reference_list)} items"
     )
     for i, ref in enumerate(reference_list):
-        logger.debug(f"[_build_llm_context]   Reference {i+1}: {ref}")
+        logger.debug(f"[_build_llm_context]   Reference {i + 1}: {ref}")
 
     final_data = convert_to_user_format(
         entities_context,
@@ -3392,7 +3394,7 @@ async def _build_llm_context(
         f"[_build_llm_context] Final data references: {len(final_data.get('data', {}).get('references', []))} items"
     )
     for i, ref in enumerate(final_data.get("data", {}).get("references", [])):
-        logger.debug(f"[_build_llm_context]   Final reference {i+1}: {ref}")
+        logger.debug(f"[_build_llm_context]   Final reference {i + 1}: {ref}")
     return result, final_data
 
 
@@ -3544,7 +3546,7 @@ async def _get_node_data(
             entity_matches_filter = False
 
             logger.debug(
-                f"[Entity {i+1}/{len(results)}] Processing entity '{entity_name}' with source_id: {source_id[:100]}..."
+                f"[Entity {i + 1}/{len(results)}] Processing entity '{entity_name}' with source_id: {source_id[:100]}..."
             )
 
             if source_id:
@@ -4616,5 +4618,8 @@ async def naive_query(
     else:
         # Streaming response (AsyncIterator)
         return QueryResult(
-            response_iterator=response, raw_data=raw_data, is_streaming=True, token_usage=token_usage
+            response_iterator=response,
+            raw_data=raw_data,
+            is_streaming=True,
+            token_usage=token_usage,
         )

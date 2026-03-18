@@ -1478,8 +1478,7 @@ async def aexport_data(
 
     else:
         raise ValueError(
-            f"Unsupported file format: {file_format}. "
-            f"Choose from: csv, excel, md, txt"
+            f"Unsupported file format: {file_format}. Choose from: csv, excel, md, txt"
         )
     if file_format is not None:
         print(f"Data exported to: {output_path} with format: {file_format}")
@@ -2847,7 +2846,7 @@ def convert_to_user_format(
         f"[convert_to_user_format] References received: {len(references)} items"
     )
     for i, ref in enumerate(references):
-        logger.debug(f"[convert_to_user_format]   Reference {i+1}: {ref}")
+        logger.debug(f"[convert_to_user_format]   Reference {i + 1}: {ref}")
 
     return {
         "status": "success",
@@ -2919,7 +2918,7 @@ def generate_reference_list_from_chunks(
             chunk_full_doc_id = chunk.get("full_doc_id", "")
             chunk_file_path = chunk.get("file_path", "")
             logger.debug(
-                f"[REFERENCE FILTERING]   Chunk {i+1}: file_path='{chunk_file_path}', full_doc_id='{chunk_full_doc_id}'"
+                f"[REFERENCE FILTERING]   Chunk {i + 1}: file_path='{chunk_file_path}', full_doc_id='{chunk_full_doc_id}'"
             )
 
         # Filter file paths to only include those from target documents

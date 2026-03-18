@@ -460,7 +460,9 @@ def create_app(args):
                 elif binding == "azure_openai":
                     from lightrag.llm.azure_openai import azure_openai_embed
 
-                    return await azure_openai_embed(texts, model=model, api_key=api_key, token_tracker=token_tracker)
+                    return await azure_openai_embed(
+                        texts, model=model, api_key=api_key, token_tracker=token_tracker
+                    )
                 elif binding == "aws_bedrock":
                     from lightrag.llm.bedrock import bedrock_embed
 

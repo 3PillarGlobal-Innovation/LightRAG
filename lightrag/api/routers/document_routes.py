@@ -2513,8 +2513,15 @@ def create_document_routes(
                 if metadata and doc_status.status != DocStatus.PROCESSED.value:
                     # Strip token usage from non-processed documents
                     metadata = {
-                        k: v for k, v in metadata.items()
-                        if k not in ("llm_token_usage", "embedding_token_usage", "llm_model_name", "embedding_model_name")
+                        k: v
+                        for k, v in metadata.items()
+                        if k
+                        not in (
+                            "llm_token_usage",
+                            "embedding_token_usage",
+                            "llm_model_name",
+                            "embedding_model_name",
+                        )
                     }
                 documents.append(
                     DocStatusResponse(

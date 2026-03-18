@@ -113,7 +113,8 @@ async def azure_openai_complete_if_cache(
         if token_tracker and hasattr(response, "usage") and response.usage:
             token_counts = {
                 "prompt_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
+                "completion_tokens": getattr(response.usage, "completion_tokens", 0)
+                or 0,
                 "total_tokens": getattr(response.usage, "total_tokens", 0) or 0,
             }
             token_tracker.add_usage(token_counts)
