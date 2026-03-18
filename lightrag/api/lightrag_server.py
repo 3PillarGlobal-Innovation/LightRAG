@@ -429,7 +429,8 @@ def create_app(args):
         Uses lazy imports for all bindings and avoids repeated configuration parsing.
         """
 
-        async def optimized_embedding_function(texts):
+        async def optimized_embedding_function(texts, **kwargs):
+            token_tracker = kwargs.pop("token_tracker", None)
             try:
                 if binding == "lollms":
                     from lightrag.llm.lollms import lollms_embed
@@ -459,7 +460,7 @@ def create_app(args):
                 elif binding == "azure_openai":
                     from lightrag.llm.azure_openai import azure_openai_embed
 
-                    return await azure_openai_embed(texts, model=model, api_key=api_key)
+                    return await azure_openai_embed(texts, model=model, api_key=api_key, token_tracker=token_tracker)
                 elif binding == "aws_bedrock":
                     from lightrag.llm.bedrock import bedrock_embed
 

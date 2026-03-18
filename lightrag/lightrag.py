@@ -1558,10 +1558,10 @@ class LightRAG:
                             doc_llm_token_tracker = TokenTracker()
                             doc_embedding_token_tracker = TokenTracker()
 
-                            # Set embedding tracker on embedding funcs for this document
-                            self.chunks_vdb.embedding_func.token_tracker = doc_embedding_token_tracker
-                            self.entities_vdb.embedding_func.token_tracker = doc_embedding_token_tracker
-                            self.relationships_vdb.embedding_func.token_tracker = doc_embedding_token_tracker
+                            # Set embedding tracker on the original EmbeddingFunc instance
+                            # (embedding_func is wrapped by priority_limit_async_func_call,
+                            # so we access the original via __wrapped__)
+                            self.embedding_func.__wrapped__.token_tracker = doc_embedding_token_tracker
 
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
@@ -1637,10 +1637,8 @@ class LightRAG:
                                 if task and not task.done():
                                     task.cancel()
 
-                            # Clear embedding tracker from shared embedding funcs
-                            self.chunks_vdb.embedding_func.token_tracker = None
-                            self.entities_vdb.embedding_func.token_tracker = None
-                            self.relationships_vdb.embedding_func.token_tracker = None
+                            # Clear embedding tracker from shared embedding func
+                            self.embedding_func.__wrapped__.token_tracker = None
 
                             # Persistent llm cache
                             if self.llm_response_cache:
@@ -1697,10 +1695,8 @@ class LightRAG:
                                 # Record processing end time
                                 processing_end_time = int(time.time())
 
-                                # Clear embedding tracker from shared embedding funcs
-                                self.chunks_vdb.embedding_func.token_tracker = None
-                                self.entities_vdb.embedding_func.token_tracker = None
-                                self.relationships_vdb.embedding_func.token_tracker = None
+                                # Clear embedding tracker from shared embedding func
+                                self.embedding_func.__wrapped__.token_tracker = None
 
                                 # Collect token usage from document processing
                                 llm_token_usage = doc_llm_token_tracker.get_usage()
@@ -1725,8 +1721,8 @@ class LightRAG:
                                                 "processing_end_time": processing_end_time,
                                                 "llm_token_usage": llm_token_usage,
                                                 "embedding_token_usage": embedding_token_usage,
-                                                "llm_model_name": self.llm_model_name,
-                                                "embedding_model_name": os.environ.get("EMBEDDING_MODEL"),
+                                                "llm_model_name": os.environ.get("AZURE_OPENAI_DEPLOYMENT") or self.llm_model_name,
+                                                "embedding_model_name": os.environ.get("AZURE_EMBEDDING_DEPLOYMENT") or os.environ.get("EMBEDDING_MODEL"),
                                             },
                                         }
                                     }
@@ -2462,7 +2458,7 @@ class LightRAG:
 
             # Attach token usage and model info for cost tracking
             raw_data["token_usage"] = query_result.token_usage or {}
-            raw_data["model_name"] = self.llm_model_name
+            raw_data["model_name"] = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or self.llm_model_name
 
             return raw_data
 

@@ -875,6 +875,9 @@ def priority_limit_async_func_call(
         # Add shutdown method to decorated function
         wait_func.shutdown = shutdown
 
+        # Preserve reference to wrapped function for attribute access (e.g. EmbeddingFunc.token_tracker)
+        wait_func.__wrapped__ = func
+
         return wait_func
 
     return final_decro
