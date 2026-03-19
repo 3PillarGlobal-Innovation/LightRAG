@@ -68,6 +68,7 @@ async def azure_openai_complete_if_cache(
     kwargs.pop("hashing_kv", None)
     kwargs.pop("keyword_extraction", None)
     timeout = kwargs.pop("timeout", None)
+    token_tracker = kwargs.pop("token_tracker", None)
 
     openai_async_client = AsyncAzureOpenAI(
         azure_endpoint=base_url,
@@ -108,6 +109,16 @@ async def azure_openai_complete_if_cache(
 
         return inner()
     else:
+        # Track token usage if token_tracker is provided
+        if token_tracker and hasattr(response, "usage") and response.usage:
+            token_counts = {
+                "prompt_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(response.usage, "completion_tokens", 0)
+                or 0,
+                "total_tokens": getattr(response.usage, "total_tokens", 0) or 0,
+            }
+            token_tracker.add_usage(token_counts)
+
         content = response.choices[0].message.content
         if r"\u" in content:
             content = safe_unicode_decode(content.encode("utf-8"))
@@ -142,6 +153,7 @@ async def azure_openai_embed(
     base_url: str | None = None,
     api_key: str | None = None,
     api_version: str | None = None,
+    token_tracker=None,
 ) -> np.ndarray:
     deployment = (
         os.getenv("AZURE_EMBEDDING_DEPLOYMENT")
@@ -174,4 +186,13 @@ async def azure_openai_embed(
     response = await openai_async_client.embeddings.create(
         model=model, input=texts, encoding_format="float"
     )
+
+    if token_tracker and hasattr(response, "usage") and response.usage:
+        token_counts = {
+            "prompt_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
+            "completion_tokens": 0,
+            "total_tokens": getattr(response.usage, "total_tokens", 0) or 0,
+        }
+        token_tracker.add_usage(token_counts)
+
     return np.array([dp.embedding for dp in response.data])

@@ -341,8 +341,11 @@ class EmbeddingFunc:
     embedding_dim: int
     func: callable
     max_token_size: int | None = None  # deprecated keep it for compatible only
+    token_tracker: "TokenTracker | None" = None
 
     async def __call__(self, *args, **kwargs) -> np.ndarray:
+        if self.token_tracker is not None and "token_tracker" not in kwargs:
+            kwargs["token_tracker"] = self.token_tracker
         return await self.func(*args, **kwargs)
 
 
@@ -871,6 +874,9 @@ def priority_limit_async_func_call(
 
         # Add shutdown method to decorated function
         wait_func.shutdown = shutdown
+
+        # Preserve reference to wrapped function for attribute access (e.g. EmbeddingFunc.token_tracker)
+        wait_func.__wrapped__ = func
 
         return wait_func
 
@@ -1472,8 +1478,7 @@ async def aexport_data(
 
     else:
         raise ValueError(
-            f"Unsupported file format: {file_format}. "
-            f"Choose from: csv, excel, md, txt"
+            f"Unsupported file format: {file_format}. Choose from: csv, excel, md, txt"
         )
     if file_format is not None:
         print(f"Data exported to: {output_path} with format: {file_format}")
@@ -1601,6 +1606,7 @@ async def use_llm_func_with_cache(
     cache_type: str = "extract",
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
+    token_tracker: "TokenTracker | None" = None,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -1683,6 +1689,8 @@ async def use_llm_func_with_cache(
             kwargs["history_messages"] = safe_history_messages
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if token_tracker is not None:
+            kwargs["token_tracker"] = token_tracker
 
         res: str = await use_llm_func(
             safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
@@ -1717,6 +1725,8 @@ async def use_llm_func_with_cache(
         kwargs["history_messages"] = safe_history_messages
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if token_tracker is not None:
+        kwargs["token_tracker"] = token_tracker
 
     try:
         res = await use_llm_func(
@@ -2836,7 +2846,7 @@ def convert_to_user_format(
         f"[convert_to_user_format] References received: {len(references)} items"
     )
     for i, ref in enumerate(references):
-        logger.debug(f"[convert_to_user_format]   Reference {i+1}: {ref}")
+        logger.debug(f"[convert_to_user_format]   Reference {i + 1}: {ref}")
 
     return {
         "status": "success",
@@ -2908,7 +2918,7 @@ def generate_reference_list_from_chunks(
             chunk_full_doc_id = chunk.get("full_doc_id", "")
             chunk_file_path = chunk.get("file_path", "")
             logger.debug(
-                f"[REFERENCE FILTERING]   Chunk {i+1}: file_path='{chunk_file_path}', full_doc_id='{chunk_full_doc_id}'"
+                f"[REFERENCE FILTERING]   Chunk {i + 1}: file_path='{chunk_file_path}', full_doc_id='{chunk_full_doc_id}'"
             )
 
         # Filter file paths to only include those from target documents

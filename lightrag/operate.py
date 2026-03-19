@@ -11,6 +11,7 @@ from .utils import (
     logger,
     compute_mdhash_id,
     Tokenizer,
+    TokenTracker,
     is_float_regex,
     sanitize_and_normalize_extracted_text,
     pack_user_ass_to_openai_messages,
@@ -125,6 +126,7 @@ async def _handle_entity_relation_summary(
     seperator: str,
     global_config: dict,
     llm_response_cache: BaseKVStorage | None = None,
+    token_tracker: TokenTracker | None = None,
 ) -> tuple[str, bool]:
     """Handle entity relation description summary using map-reduce approach.
 
@@ -187,6 +189,7 @@ async def _handle_entity_relation_summary(
                     current_list,
                     global_config,
                     llm_response_cache,
+                    token_tracker=token_tracker,
                 )
                 return final_summary, True  # LLM was used for final summarization
 
@@ -242,6 +245,7 @@ async def _handle_entity_relation_summary(
                     chunk,
                     global_config,
                     llm_response_cache,
+                    token_tracker=token_tracker,
                 )
                 new_summaries.append(summary)
                 llm_was_used = True  # Mark that LLM was used in reduce phase
@@ -256,6 +260,7 @@ async def _summarize_descriptions(
     description_list: list[str],
     global_config: dict,
     llm_response_cache: BaseKVStorage | None = None,
+    token_tracker: TokenTracker | None = None,
 ) -> str:
     """Helper function to summarize a list of descriptions using LLM.
 
@@ -314,6 +319,7 @@ async def _summarize_descriptions(
         use_llm_func,
         llm_response_cache=llm_response_cache,
         cache_type="summary",
+        token_tracker=token_tracker,
     )
     return summary
 
@@ -341,6 +347,15 @@ async def _handle_single_entity_extraction(
         if not entity_name or not entity_name.strip():
             logger.warning(
                 f"Entity extraction error: entity name became empty after cleaning. Original: '{record_attributes[1]}'"
+            )
+            return None
+
+        # Reject entity names that are too long (PostgreSQL VARCHAR(512) limit)
+        # Garbled LLM output (e.g. base64-like strings) typically produces very long names
+        if len(entity_name) > 512:
+            logger.warning(
+                f"Entity extraction error: entity name too long ({len(entity_name)} chars, max 512). "
+                f"Likely garbled LLM output. Prefix: '{entity_name[:80]}...'"
             )
             return None
 
@@ -401,7 +416,7 @@ async def _handle_single_relationship_extraction(
     ):  # treat "relationship" and "relation" interchangeable
         if len(record_attributes) > 1 and "relation" in record_attributes[0]:
             logger.warning(
-                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) >2 else 'N/A'}`"
+                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
             )
             logger.debug(record_attributes)
         return None
@@ -424,6 +439,21 @@ async def _handle_single_relationship_extraction(
         if not target:
             logger.warning(
                 f"Relationship extraction error: target entity became empty after cleaning. Original: '{record_attributes[2]}'"
+            )
+            return None
+
+        # Reject entity names that are too long (PostgreSQL VARCHAR(512) limit)
+        if len(source) > 512:
+            logger.warning(
+                f"Relationship extraction error: source entity name too long ({len(source)} chars, max 512). "
+                f"Likely garbled LLM output. Prefix: '{source[:80]}...'"
+            )
+            return None
+
+        if len(target) > 512:
+            logger.warning(
+                f"Relationship extraction error: target entity name too long ({len(target)} chars, max 512). "
+                f"Likely garbled LLM output. Prefix: '{target[:80]}...'"
             )
             return None
 
@@ -1295,6 +1325,7 @@ async def _merge_nodes_then_upsert(
     pipeline_status: dict = None,
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
+    token_tracker: TokenTracker | None = None,
 ):
     """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
     already_entity_types = []
@@ -1350,6 +1381,7 @@ async def _merge_nodes_then_upsert(
             GRAPH_FIELD_SEP,
             global_config,
             llm_response_cache,
+            token_tracker=token_tracker,
         )
 
         # Log based on actual LLM usage
@@ -1402,6 +1434,7 @@ async def _merge_edges_then_upsert(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
     added_entities: list = None,  # New parameter to track entities added during edge processing
+    token_tracker: TokenTracker | None = None,
 ):
     if src_id == tgt_id:
         return None
@@ -1482,6 +1515,7 @@ async def _merge_edges_then_upsert(
             GRAPH_FIELD_SEP,
             global_config,
             llm_response_cache,
+            token_tracker=token_tracker,
         )
 
         # Log based on actual LLM usage
@@ -1591,6 +1625,7 @@ async def merge_nodes_and_edges(
     current_file_number: int = 0,
     total_files: int = 0,
     file_path: str = "unknown_source",
+    token_tracker: TokenTracker | None = None,
 ) -> None:
     """Two-phase merge: process all entities first, then all relationships
 
@@ -1667,6 +1702,7 @@ async def merge_nodes_and_edges(
                         pipeline_status,
                         pipeline_status_lock,
                         llm_response_cache,
+                        token_tracker=token_tracker,
                     )
 
                     # Vector database operation (equally critical, must succeed)
@@ -1798,6 +1834,7 @@ async def merge_nodes_and_edges(
                         pipeline_status_lock,
                         llm_response_cache,
                         added_entities,  # Pass list to collect added entities
+                        token_tracker=token_tracker,
                     )
 
                     if edge_data is None:
@@ -2014,6 +2051,7 @@ async def extract_entities(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
     text_chunks_storage: BaseKVStorage | None = None,
+    token_tracker: TokenTracker | None = None,
 ) -> list:
     use_llm_func: callable = global_config["llm_model_func"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
@@ -2084,6 +2122,7 @@ async def extract_entities(
             cache_type="extract",
             chunk_id=chunk_key,
             cache_keys_collector=cache_keys_collector,
+            token_tracker=token_tracker,
         )
 
         history = pack_user_ass_to_openai_messages(
@@ -2111,6 +2150,7 @@ async def extract_entities(
                 cache_type="extract",
                 chunk_id=chunk_key,
                 cache_keys_collector=cache_keys_collector,
+                token_tracker=token_tracker,
             )
 
             # Process gleaning result separately with file path
@@ -2225,7 +2265,7 @@ async def extract_entities(
             await asyncio.wait(pending)
 
         # Add progress prefix to the exception message
-        progress_prefix = f"C[{processed_chunks+1}/{total_chunks}]"
+        progress_prefix = f"C[{processed_chunks + 1}/{total_chunks}]"
 
         # Re-raise the original exception with a prefix
         prefixed_exception = create_prefixed_exception(first_exception, progress_prefix)
@@ -2378,6 +2418,9 @@ async def kg_query(
         hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
     )
 
+    # Track token usage for LLM calls
+    query_token_tracker = TokenTracker()
+
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
         logger.info(
@@ -2391,6 +2434,7 @@ async def kg_query(
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            token_tracker=query_token_tracker,
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
@@ -2419,6 +2463,8 @@ async def kg_query(
                 ),
             )
 
+    token_usage = query_token_tracker.get_usage()
+
     # Return unified result based on actual response type
     if isinstance(response, str):
         # Non-streaming response (string)
@@ -2433,13 +2479,16 @@ async def kg_query(
                 .strip()
             )
 
-        return QueryResult(content=response, raw_data=context_result.raw_data)
+        return QueryResult(
+            content=response, raw_data=context_result.raw_data, token_usage=token_usage
+        )
     else:
         # Streaming response (AsyncIterator)
         return QueryResult(
             response_iterator=response,
             raw_data=context_result.raw_data,
             is_streaming=True,
+            token_usage=token_usage,
         )
 
 
@@ -3327,7 +3376,7 @@ async def _build_llm_context(
         f"[_build_llm_context] Reference list being passed: {len(reference_list)} items"
     )
     for i, ref in enumerate(reference_list):
-        logger.debug(f"[_build_llm_context]   Reference {i+1}: {ref}")
+        logger.debug(f"[_build_llm_context]   Reference {i + 1}: {ref}")
 
     final_data = convert_to_user_format(
         entities_context,
@@ -3345,7 +3394,7 @@ async def _build_llm_context(
         f"[_build_llm_context] Final data references: {len(final_data.get('data', {}).get('references', []))} items"
     )
     for i, ref in enumerate(final_data.get("data", {}).get("references", [])):
-        logger.debug(f"[_build_llm_context]   Final reference {i+1}: {ref}")
+        logger.debug(f"[_build_llm_context]   Final reference {i + 1}: {ref}")
     return result, final_data
 
 
@@ -3497,7 +3546,7 @@ async def _get_node_data(
             entity_matches_filter = False
 
             logger.debug(
-                f"[Entity {i+1}/{len(results)}] Processing entity '{entity_name}' with source_id: {source_id[:100]}..."
+                f"[Entity {i + 1}/{len(results)}] Processing entity '{entity_name}' with source_id: {source_id[:100]}..."
             )
 
             if source_id:
@@ -4505,6 +4554,9 @@ async def naive_query(
     cached_result = await handle_cache(
         hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
     )
+    # Track token usage for LLM calls
+    query_token_tracker = TokenTracker()
+
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
         logger.info(
@@ -4518,6 +4570,7 @@ async def naive_query(
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            token_tracker=query_token_tracker,
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
@@ -4544,6 +4597,8 @@ async def naive_query(
                 ),
             )
 
+    token_usage = query_token_tracker.get_usage()
+
     # Return unified result based on actual response type
     if isinstance(response, str):
         # Non-streaming response (string)
@@ -4559,9 +4614,12 @@ async def naive_query(
                 .strip()
             )
 
-        return QueryResult(content=response, raw_data=raw_data)
+        return QueryResult(content=response, raw_data=raw_data, token_usage=token_usage)
     else:
         # Streaming response (AsyncIterator)
         return QueryResult(
-            response_iterator=response, raw_data=raw_data, is_streaming=True
+            response_iterator=response,
+            raw_data=raw_data,
+            is_streaming=True,
+            token_usage=token_usage,
         )

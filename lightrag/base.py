@@ -844,12 +844,14 @@ class QueryResult:
         response_iterator: Streaming response iterator for streaming responses
         raw_data: Complete structured data including references and metadata
         is_streaming: Whether this is a streaming result
+        token_usage: Token usage statistics from LLM calls (prompt_tokens, completion_tokens, total_tokens, call_count)
     """
 
     content: Optional[str] = None
     response_iterator: Optional[AsyncIterator[str]] = None
     raw_data: Optional[Dict[str, Any]] = None
     is_streaming: bool = False
+    token_usage: Optional[Dict[str, int]] = None
 
     @property
     def reference_list(self) -> List[Dict[str, str]]:

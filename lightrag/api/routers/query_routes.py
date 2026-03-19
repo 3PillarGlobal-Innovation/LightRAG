@@ -132,6 +132,30 @@ class QueryRequest(BaseModel):
         return param
 
 
+class TokenCountResponse(BaseModel):
+    prompt_tokens: int = Field(default=0, description="Number of input tokens")
+    completion_tokens: int = Field(default=0, description="Number of output tokens")
+    total_tokens: int = Field(
+        default=0, description="Total tokens (prompt + completion)"
+    )
+    call_count: int = Field(default=0, description="Number of API calls made")
+
+
+class TokenUsageResponse(BaseModel):
+    llm: Optional[TokenCountResponse] = Field(
+        default=None, description="LLM token usage"
+    )
+    embedding: Optional[TokenCountResponse] = Field(
+        default=None, description="Embedding token usage"
+    )
+    llm_model_name: Optional[str] = Field(
+        default=None, description="LLM model/deployment used"
+    )
+    embedding_model_name: Optional[str] = Field(
+        default=None, description="Embedding model/deployment used"
+    )
+
+
 class QueryResponse(BaseModel):
     response: str = Field(
         description="The generated response",
@@ -139,6 +163,10 @@ class QueryResponse(BaseModel):
     references: Optional[List[Dict[str, str]]] = Field(
         default=None,
         description="Reference list (Disabled when include_references=False, /query/data always includes references.)",
+    )
+    token_usage: Optional[TokenUsageResponse] = Field(
+        default=None,
+        description="Token usage statistics for cost calculation",
     )
 
 
@@ -373,11 +401,37 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             logger.debug(f"[API] Final references being returned: {references}")
             logger.debug(f"[API] include_references flag: {request.include_references}")
 
+            # Build token usage response
+            raw_token_usage = result.get("token_usage", {})
+            raw_embedding_usage = result.get("embedding_token_usage", {})
+            token_usage = TokenUsageResponse(
+                llm=TokenCountResponse(
+                    prompt_tokens=raw_token_usage.get("prompt_tokens", 0),
+                    completion_tokens=raw_token_usage.get("completion_tokens", 0),
+                    total_tokens=raw_token_usage.get("total_tokens", 0),
+                    call_count=raw_token_usage.get("call_count", 0),
+                ),
+                embedding=TokenCountResponse(
+                    prompt_tokens=raw_embedding_usage.get("prompt_tokens", 0),
+                    completion_tokens=raw_embedding_usage.get("completion_tokens", 0),
+                    total_tokens=raw_embedding_usage.get("total_tokens", 0),
+                    call_count=raw_embedding_usage.get("call_count", 0),
+                ),
+                llm_model_name=result.get("model_name"),
+                embedding_model_name=result.get("embedding_model_name"),
+            )
+
             # Return response with or without references based on request
             if request.include_references:
-                return QueryResponse(response=response_content, references=references)
+                return QueryResponse(
+                    response=response_content,
+                    references=references,
+                    token_usage=token_usage,
+                )
             else:
-                return QueryResponse(response=response_content, references=None)
+                return QueryResponse(
+                    response=response_content, references=None, token_usage=token_usage
+                )
         except Exception as e:
             trace_exception(e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -588,6 +642,30 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 references = result.get("data", {}).get("references", [])
                 llm_response = result.get("llm_response", {})
 
+                # Build token usage info for final message
+                raw_token_usage = result.get("token_usage", {})
+                raw_embedding_usage = result.get("embedding_token_usage", {})
+                token_usage_data = {
+                    "llm": {
+                        "prompt_tokens": raw_token_usage.get("prompt_tokens", 0),
+                        "completion_tokens": raw_token_usage.get(
+                            "completion_tokens", 0
+                        ),
+                        "total_tokens": raw_token_usage.get("total_tokens", 0),
+                        "call_count": raw_token_usage.get("call_count", 0),
+                    },
+                    "embedding": {
+                        "prompt_tokens": raw_embedding_usage.get("prompt_tokens", 0),
+                        "completion_tokens": raw_embedding_usage.get(
+                            "completion_tokens", 0
+                        ),
+                        "total_tokens": raw_embedding_usage.get("total_tokens", 0),
+                        "call_count": raw_embedding_usage.get("call_count", 0),
+                    },
+                    "llm_model_name": result.get("model_name"),
+                    "embedding_model_name": result.get("embedding_model_name"),
+                }
+
                 if llm_response.get("is_streaming"):
                     # Streaming mode: send references first, then stream response chunks
                     if request.include_references:
@@ -602,6 +680,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                         except Exception as e:
                             logging.error(f"Streaming error: {str(e)}")
                             yield f"{json.dumps({'error': str(e)})}\n"
+
+                    # Send token usage as final message in stream
+                    yield f"{json.dumps({'token_usage': token_usage_data})}\n"
                 else:
                     # Non-streaming mode: send complete response in one message
                     response_content = llm_response.get("content", "")
@@ -612,6 +693,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     complete_response = {"response": response_content}
                     if request.include_references:
                         complete_response["references"] = references
+                    complete_response["token_usage"] = token_usage_data
 
                     yield f"{json.dumps(complete_response)}\n"
 

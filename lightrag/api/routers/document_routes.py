@@ -2508,6 +2508,21 @@ def create_document_routes(
             status_summary = {}
 
             for doc_id, doc_status in docs_by_track_id.items():
+                # Only include token usage in metadata when document is processed
+                metadata = doc_status.metadata
+                if metadata and doc_status.status != DocStatus.PROCESSED.value:
+                    # Strip token usage from non-processed documents
+                    metadata = {
+                        k: v
+                        for k, v in metadata.items()
+                        if k
+                        not in (
+                            "llm_token_usage",
+                            "embedding_token_usage",
+                            "llm_model_name",
+                            "embedding_model_name",
+                        )
+                    }
                 documents.append(
                     DocStatusResponse(
                         id=doc_id,
@@ -2519,7 +2534,7 @@ def create_document_routes(
                         track_id=doc_status.track_id,
                         chunks_count=doc_status.chunks_count,
                         error_msg=doc_status.error_msg,
-                        metadata=doc_status.metadata,
+                        metadata=metadata,
                         file_path=doc_status.file_path,
                     )
                 )
