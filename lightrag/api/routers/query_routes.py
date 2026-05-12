@@ -184,6 +184,39 @@ class TokenUsageResponse(BaseModel):
     )
 
 
+def _build_token_usage_response(result: Dict[str, Any]) -> Optional["TokenUsageResponse"]:
+    """Shape aquery_llm's flat token_usage / embedding_token_usage dicts into
+    the response model the backend's cost logger expects.
+
+    Returns None when nothing was tracked (e.g. cache-only path with no LLM
+    or embedding calls), so the response field stays clean.
+    """
+    raw_llm = result.get("token_usage") or {}
+    raw_emb = result.get("embedding_token_usage") or {}
+    if not raw_llm.get("call_count") and not raw_emb.get("call_count"):
+        return None
+    return TokenUsageResponse(
+        llm=TokenCountResponse(
+            prompt_tokens=raw_llm.get("prompt_tokens", 0),
+            completion_tokens=raw_llm.get("completion_tokens", 0),
+            total_tokens=raw_llm.get("total_tokens", 0),
+            call_count=raw_llm.get("call_count", 0),
+        )
+        if raw_llm.get("call_count")
+        else None,
+        embedding=TokenCountResponse(
+            prompt_tokens=raw_emb.get("prompt_tokens", 0),
+            completion_tokens=raw_emb.get("completion_tokens", 0),
+            total_tokens=raw_emb.get("total_tokens", 0),
+            call_count=raw_emb.get("call_count", 0),
+        )
+        if raw_emb.get("call_count")
+        else None,
+        llm_model_name=result.get("model_name"),
+        embedding_model_name=result.get("embedding_model_name"),
+    )
+
+
 class QueryResponse(BaseModel):
     response: str = Field(
         description="The generated response",
@@ -459,6 +492,7 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
             llm_response = result.get("llm_response", {})
             data = result.get("data", {})
             references = data.get("references", [])
+            token_usage = _build_token_usage_response(result)
 
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
@@ -490,9 +524,17 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
 
             # Return response with or without references based on request
             if request.include_references:
-                return QueryResponse(response=response_content, references=references)
+                return QueryResponse(
+                    response=response_content,
+                    references=references,
+                    token_usage=token_usage,
+                )
             else:
-                return QueryResponse(response=response_content, references=None)
+                return QueryResponse(
+                    response=response_content,
+                    references=None,
+                    token_usage=token_usage,
+                )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -742,6 +784,11 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                         enriched_references.append(ref_copy)
                     references = enriched_references
 
+                token_usage = _build_token_usage_response(result)
+                token_usage_dump = (
+                    token_usage.model_dump(exclude_none=True) if token_usage else None
+                )
+
                 if llm_response.get("is_streaming"):
                     # Streaming mode: send references first, then stream response chunks
                     if request.include_references:
@@ -756,6 +803,11 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                         except Exception as e:
                             logger.error(f"Streaming error: {str(e)}")
                             yield f"{json.dumps({'error': str(e)})}\n"
+
+                    # Emit token usage as the final NDJSON frame so streaming
+                    # clients can record cost without re-querying.
+                    if token_usage_dump is not None:
+                        yield f"{json.dumps({'token_usage': token_usage_dump})}\n"
                 else:
                     # Non-streaming mode: send complete response in one message
                     response_content = llm_response.get("content", "")
@@ -766,6 +818,8 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                     complete_response = {"response": response_content}
                     if request.include_references:
                         complete_response["references"] = references
+                    if token_usage_dump is not None:
+                        complete_response["token_usage"] = token_usage_dump
 
                     yield f"{json.dumps(complete_response)}\n"
 
