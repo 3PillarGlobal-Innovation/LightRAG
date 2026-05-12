@@ -98,6 +98,7 @@ from lightrag.utils import (
     Tokenizer,
     TiktokenTokenizer,
     EmbeddingFunc,
+    TokenTracker,
     always_get_an_event_loop,
     compute_mdhash_id,
     lazy_external_import,
@@ -2911,6 +2912,32 @@ class LightRAG:
 
         global_config = asdict(self)
 
+        # Per-request token trackers. The LLM tracker is injected by wrapping
+        # llm_model_func via partial — any call through the wrapped func gets
+        # token_tracker=... passed to the provider, which records usage. The
+        # embedding tracker attaches to the live EmbeddingFunc wrapper for the
+        # duration of the query and is reset in `finally`.
+        llm_tracker = TokenTracker()
+        embedding_tracker = TokenTracker()
+
+        original_llm_func = global_config["llm_model_func"]
+        global_config["llm_model_func"] = partial(
+            original_llm_func, token_tracker=llm_tracker
+        )
+        if param.model_func is not None:
+            param = replace(param, model_func=partial(param.model_func, token_tracker=llm_tracker))
+
+        embedding_inner = getattr(self.embedding_func, "__wrapped__", self.embedding_func)
+        embedding_inner.token_tracker = embedding_tracker
+
+        def _build_token_usage_block() -> dict[str, Any]:
+            return {
+                "token_usage": llm_tracker.get_usage(),
+                "embedding_token_usage": embedding_tracker.get_usage(),
+                "model_name": self.llm_model_name,
+                "embedding_model_name": getattr(embedding_inner, "model_name", None),
+            }
+
         try:
             query_result = None
 
@@ -2961,6 +2988,7 @@ class LightRAG:
                             "response_iterator": None,
                             "is_streaming": False,
                         },
+                        **_build_token_usage_block(),
                     }
                 else:
                     return {
@@ -2973,6 +3001,7 @@ class LightRAG:
                             "response_iterator": response,
                             "is_streaming": True,
                         },
+                        **_build_token_usage_block(),
                     }
             else:
                 raise ValueError(f"Unknown mode {param.mode}")
@@ -2994,6 +3023,7 @@ class LightRAG:
                         "response_iterator": None,
                         "is_streaming": False,
                     },
+                    **_build_token_usage_block(),
                 }
 
             # Extract structured data from query result
@@ -3007,6 +3037,7 @@ class LightRAG:
                 else None,
                 "is_streaming": query_result.is_streaming,
             }
+            raw_data.update(_build_token_usage_block())
 
             return raw_data
 
@@ -3023,7 +3054,12 @@ class LightRAG:
                     "response_iterator": None,
                     "is_streaming": False,
                 },
+                **_build_token_usage_block(),
             }
+        finally:
+            # Detach the embedding tracker so future requests don't accidentally
+            # share usage state through the shared EmbeddingFunc wrapper.
+            embedding_inner.token_tracker = None
 
     def query_llm(
         self,

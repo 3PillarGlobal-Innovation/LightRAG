@@ -152,6 +152,38 @@ class ReferenceItem(BaseModel):
     )
 
 
+class TokenCountResponse(BaseModel):
+    prompt_tokens: int = Field(default=0, description="Number of input tokens")
+    completion_tokens: int = Field(default=0, description="Number of output tokens")
+    total_tokens: int = Field(
+        default=0, description="Total tokens (prompt + completion)"
+    )
+    call_count: int = Field(default=0, description="Number of API calls made")
+
+
+class TokenUsageResponse(BaseModel):
+    """Token usage statistics for cost tracking.
+
+    `llm` covers the answer-generation LLM call (and any keyword-extraction
+    LLM calls). `embedding` covers the embedding-model calls made for query
+    retrieval. Model names are surfaced so cost calculation downstream can
+    pick the right rate card.
+    """
+
+    llm: Optional[TokenCountResponse] = Field(
+        default=None, description="LLM token usage"
+    )
+    embedding: Optional[TokenCountResponse] = Field(
+        default=None, description="Embedding token usage"
+    )
+    llm_model_name: Optional[str] = Field(
+        default=None, description="LLM model/deployment used"
+    )
+    embedding_model_name: Optional[str] = Field(
+        default=None, description="Embedding model/deployment used"
+    )
+
+
 class QueryResponse(BaseModel):
     response: str = Field(
         description="The generated response",
@@ -159,6 +191,10 @@ class QueryResponse(BaseModel):
     references: Optional[List[ReferenceItem]] = Field(
         default=None,
         description="Reference list (Disabled when include_references=False, /query/data always includes references.)",
+    )
+    token_usage: Optional[TokenUsageResponse] = Field(
+        default=None,
+        description="LLM + embedding token usage for cost calculation. None when tracking is unavailable for the request.",
     )
 
 
