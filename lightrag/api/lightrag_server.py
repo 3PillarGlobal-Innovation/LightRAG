@@ -9,6 +9,7 @@ from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
+import asyncio
 import json
 import os
 import re
@@ -161,6 +162,60 @@ class LLMConfigCache:
                     "GeminiEmbeddingOptions not available, using default configuration"
                 )
                 self.gemini_embedding_options = {}
+
+
+class WorkspaceRegistry:
+    """Lazy registry of LightRAG instances keyed by workspace.
+
+    One process serves many workspaces: each request resolves to its own
+    LightRAG instance, but storage backends with ClientManager refcounting
+    (Postgres/Mongo/OpenSearch) share connection pools transparently.
+
+    Neo4j and Qdrant currently create per-instance drivers — fine for a
+    handful of workspaces, needs pool sharing in the storage layer to
+    scale to hundreds.
+    """
+
+    def __init__(self, factory, default_workspace=None):
+        # factory: (workspace: str | None) -> LightRAG
+        self._factory = factory
+        self._default_workspace = default_workspace or ""
+        self._instances: dict[str, "LightRAG"] = {}
+        self._lock = asyncio.Lock()
+
+    def _normalize(self, workspace):
+        # Empty string and None both map to the default workspace key.
+        return workspace if workspace else self._default_workspace
+
+    async def get(self, workspace):
+        key = self._normalize(workspace)
+        cached = self._instances.get(key)
+        if cached is not None:
+            return cached
+        async with self._lock:
+            cached = self._instances.get(key)
+            if cached is not None:
+                return cached
+            rag = self._factory(key or None)
+            await rag.initialize_storages()
+            self._instances[key] = rag
+            return rag
+
+    def register(self, workspace, rag):
+        self._instances[self._normalize(workspace)] = rag
+
+    def values(self):
+        return list(self._instances.values())
+
+    async def finalize_all(self):
+        for rag in self._instances.values():
+            try:
+                await rag.finalize_storages()
+            except Exception:
+                logger.exception(
+                    "Failed to finalize storages for workspace %r", rag.workspace
+                )
+        self._instances.clear()
 
 
 def check_frontend_build():
@@ -374,8 +429,13 @@ def create_app(args):
             yield
 
         finally:
-            # Clean up database connections
-            await rag.finalize_storages()
+            # Clean up database connections for every workspace instance
+            # that was lazily constructed during the server's lifetime.
+            registry = getattr(app.state, "workspace_registry", None)
+            if registry is not None:
+                await registry.finalize_all()
+            else:
+                await rag.finalize_storages()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -1163,11 +1223,16 @@ def create_app(args):
         name=args.simulated_model_name, tag=args.simulated_model_tag
     )
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
+    def _build_rag(workspace):
+        """Construct a LightRAG instance bound to the given workspace.
+
+        Storage backends with refcounted ClientManager (Postgres/Mongo/OpenSearch)
+        share connection pools across instances. Neo4j/Qdrant create per-instance
+        drivers — TODO: add pool sharing for high-cardinality workspace scale.
+        """
+        return LightRAG(
             working_dir=args.working_dir,
-            workspace=args.workspace,
+            workspace=workspace if workspace is not None else args.workspace,
             llm_model_func=create_llm_model_func(args.llm_binding),
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
@@ -1199,18 +1264,40 @@ def create_app(args):
             },
             ollama_server_infos=ollama_server_infos,
         )
+
+    # Initialize RAG for the default workspace; further workspaces are
+    # constructed lazily by the registry on first request.
+    try:
+        rag = _build_rag(args.workspace)
     except Exception as e:
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
 
+    workspace_registry = WorkspaceRegistry(
+        factory=_build_rag, default_workspace=args.workspace
+    )
+    workspace_registry.register(args.workspace, rag)
+    app.state.workspace_registry = workspace_registry
+
+    async def get_rag(request: Request) -> LightRAG:
+        """Resolve the LightRAG instance for this request via the LIGHTRAG-WORKSPACE header."""
+        workspace = get_workspace_from_request(request)
+        return await workspace_registry.get(workspace)
+
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
+    #
+    # Per-request workspace resolution is rolled out incrementally: /query already
+    # honors the LIGHTRAG-WORKSPACE header. /documents and /graph still resolve to
+    # the default workspace and will move to get_rag in follow-up commits.
     app.include_router(create_document_routes(rag, doc_manager, api_key))
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
+    app.include_router(create_query_routes(get_rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
 
-    # Add Ollama API routes
+    # Add Ollama API routes — Ollama compatibility surface stays bound to the
+    # default workspace for now. Cross-workspace Ollama support is a follow-up
+    # once /query is validated.
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
 
