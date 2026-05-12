@@ -1900,6 +1900,16 @@ class LightRAG:
                     # Per-doc indexing token trackers. Captures the LLM and
                     # embedding usage spent indexing this one document so the
                     # cost can be attributed downstream.
+                    #
+                    # IMPORTANT: we wrap llm_model_func with a *closure*, not
+                    # functools.partial. extract_entities reads the func via
+                    # `global_config = asdict(self)`, and `asdict` deep-copies
+                    # non-dataclass values — which would clone the partial's
+                    # `keywords` dict (including the TokenTracker), sending the
+                    # actual usage updates into a clone instead of our tracker.
+                    # Closures are deepcopy-immortal in Python, so the
+                    # `doc_llm_tracker` reference inside the closure survives.
+                    #
                     # CAVEAT: with max_parallel_insert > 1, multiple docs share
                     # these mutable hooks — recorded per-doc usage is
                     # approximate (totals are correct, per-doc attribution is
@@ -1907,9 +1917,12 @@ class LightRAG:
                     doc_llm_tracker = TokenTracker()
                     doc_embedding_tracker = TokenTracker()
                     original_llm_model_func = self.llm_model_func
-                    self.llm_model_func = partial(
-                        original_llm_model_func, token_tracker=doc_llm_tracker
-                    )
+
+                    async def _llm_with_tracker(*args, **kwargs):
+                        kwargs.setdefault("token_tracker", doc_llm_tracker)
+                        return await original_llm_model_func(*args, **kwargs)
+
+                    self.llm_model_func = _llm_with_tracker
                     embedding_inner = getattr(
                         self.embedding_func, "__wrapped__", self.embedding_func
                     )
