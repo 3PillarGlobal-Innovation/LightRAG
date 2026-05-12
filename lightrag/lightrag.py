@@ -1897,6 +1897,34 @@ class LightRAG:
                     chunks: dict[str, Any] = {}
                     content_data: dict[str, Any] | None = None
 
+                    # Per-doc indexing token trackers. Captures the LLM and
+                    # embedding usage spent indexing this one document so the
+                    # cost can be attributed downstream.
+                    # CAVEAT: with max_parallel_insert > 1, multiple docs share
+                    # these mutable hooks — recorded per-doc usage is
+                    # approximate (totals are correct, per-doc attribution is
+                    # fuzzy). Set MAX_PARALLEL_INSERT=1 for exact accounting.
+                    doc_llm_tracker = TokenTracker()
+                    doc_embedding_tracker = TokenTracker()
+                    original_llm_model_func = self.llm_model_func
+                    self.llm_model_func = partial(
+                        original_llm_model_func, token_tracker=doc_llm_tracker
+                    )
+                    embedding_inner = getattr(
+                        self.embedding_func, "__wrapped__", self.embedding_func
+                    )
+                    embedding_inner.token_tracker = doc_embedding_tracker
+
+                    def _doc_token_usage_metadata() -> dict[str, Any]:
+                        return {
+                            "llm_token_usage": doc_llm_tracker.get_usage(),
+                            "embedding_token_usage": doc_embedding_tracker.get_usage(),
+                            "llm_model_name": self.llm_model_name,
+                            "embedding_model_name": getattr(
+                                embedding_inner, "model_name", None
+                            ),
+                        }
+
                     def get_failed_chunk_snapshot() -> tuple[list[str], int]:
                         if chunks:
                             chunk_ids = list(chunks.keys())
@@ -2122,6 +2150,7 @@ class LightRAG:
                                         "metadata": {
                                             "processing_start_time": processing_start_time,
                                             "processing_end_time": processing_end_time,
+                                            **_doc_token_usage_metadata(),
                                         },
                                     }
                                 }
@@ -2179,6 +2208,7 @@ class LightRAG:
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
+                                                **_doc_token_usage_metadata(),
                                             },
                                         }
                                     }
@@ -2254,10 +2284,20 @@ class LightRAG:
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
+                                                **_doc_token_usage_metadata(),
                                             },
                                         }
                                     }
                                 )
+
+                    # Restore the original llm_model_func and clear the embedding
+                    # tracker now that this document is done. Done at the end of
+                    # process_document so the trackers don't leak across docs.
+                    # (The inner try/except blocks handle all expected failures,
+                    # so this point is reached on both success and handled
+                    # failure paths.)
+                    self.llm_model_func = original_llm_model_func
+                    embedding_inner.token_tracker = None
 
                 # Create processing tasks for all documents
                 doc_tasks = []
