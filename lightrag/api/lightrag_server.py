@@ -1288,12 +1288,12 @@ def create_app(args):
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
     #
-    # Per-request workspace resolution is rolled out incrementally: /query already
-    # honors the LIGHTRAG-WORKSPACE header. /documents and /graph still resolve to
-    # the default workspace and will move to get_rag in follow-up commits.
-    app.include_router(create_document_routes(rag, doc_manager, api_key))
+    # /query, /documents, and /graph all resolve the LightRAG instance per
+    # request via the LIGHTRAG-WORKSPACE header. The Ollama compatibility
+    # surface still binds to the default workspace.
+    app.include_router(create_document_routes(get_rag, doc_manager, api_key))
     app.include_router(create_query_routes(get_rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_graph_routes(get_rag, api_key))
 
     # Add Ollama API routes — Ollama compatibility surface stays bound to the
     # default workspace for now. Cross-workspace Ollama support is a follow-up
