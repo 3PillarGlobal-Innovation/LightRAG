@@ -1,6 +1,6 @@
 services:
   lightrag:
-    image: ghcr.io/hkuds/lightrag:latest
+    # image: ghcr.io/hkuds/lightrag:latest  # Commented out to use local code
     build:
       context: .
       dockerfile: Dockerfile
@@ -24,3 +24,9 @@ services:
       INPUT_DIR: "/app/data/inputs"
       HOST: "0.0.0.0"
       PORT: "9621"
+    networks:
+      poc_network:
+
+networks:
+  poc_network:
+    external: true
