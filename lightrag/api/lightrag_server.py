@@ -218,6 +218,37 @@ class WorkspaceRegistry:
         self._instances.clear()
 
 
+class DocumentManagerRegistry:
+    """Lazy registry of DocumentManager instances keyed by workspace.
+
+    Uploads land in a workspace-scoped subdirectory of args.input_dir so
+    that on-disk files don't get mixed across workspaces. Without this,
+    a `/documents/upload` request with `LIGHTRAG-WORKSPACE: solution_42`
+    would still drop the file in the server-default workspace's
+    subdirectory (the singleton DocumentManager bug).
+
+    Construction is synchronous — DocumentManager.__init__ just calls
+    Path.mkdir — so no async lock is needed; a plain dict suffices.
+    """
+
+    def __init__(self, input_dir: str, default_workspace: Optional[str] = None):
+        self._input_dir = input_dir
+        self._default_workspace = default_workspace or ""
+        self._instances: dict[str, "DocumentManager"] = {}
+
+    def _normalize(self, workspace):
+        return workspace if workspace else self._default_workspace
+
+    def get(self, workspace):
+        key = self._normalize(workspace)
+        cached = self._instances.get(key)
+        if cached is not None:
+            return cached
+        manager = DocumentManager(self._input_dir, workspace=key or "")
+        self._instances[key] = manager
+        return manager
+
+
 def check_frontend_build():
     """Check if frontend is built and optionally check if source is up-to-date
 
@@ -407,8 +438,14 @@ def create_app(args):
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
-    # Initialize document manager with workspace support for data isolation
-    doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
+    # Initialize a per-workspace DocumentManager registry so uploads land in
+    # the right workspace subdirectory of args.input_dir. Pre-create the
+    # server-default workspace's manager so the directory exists at startup
+    # (matches the pre-registry behavior).
+    doc_manager_registry = DocumentManagerRegistry(
+        input_dir=args.input_dir, default_workspace=args.workspace
+    )
+    doc_manager_registry.get(args.workspace)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1290,6 +1327,12 @@ def create_app(args):
         workspace = get_workspace_from_request(request)
         return await workspace_registry.get(workspace)
 
+    def get_doc_manager(request: Request) -> "DocumentManager":
+        """Resolve the DocumentManager for this request's workspace so on-disk
+        uploads/archives land in the right subdirectory."""
+        workspace = get_workspace_from_request(request)
+        return doc_manager_registry.get(workspace)
+
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
@@ -1297,7 +1340,7 @@ def create_app(args):
     # /query, /documents, and /graph all resolve the LightRAG instance per
     # request via the LIGHTRAG-WORKSPACE header. The Ollama compatibility
     # surface still binds to the default workspace.
-    app.include_router(create_document_routes(get_rag, doc_manager, api_key))
+    app.include_router(create_document_routes(get_rag, get_doc_manager, api_key))
     app.include_router(create_query_routes(get_rag, api_key, args.top_k))
     app.include_router(create_graph_routes(get_rag, api_key))
 
