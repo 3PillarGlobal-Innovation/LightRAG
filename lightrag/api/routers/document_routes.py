@@ -2112,8 +2112,18 @@ async def background_delete_documents(
 
 
 def create_document_routes(
-    get_rag, doc_manager: DocumentManager, api_key: Optional[str] = None
+    get_rag, get_doc_manager, api_key: Optional[str] = None
 ):
+    """Build the /documents router.
+
+    Args:
+        get_rag: callable(request) -> awaitable LightRAG. Resolves the
+            LightRAG instance for the request's workspace.
+        get_doc_manager: callable(request) -> DocumentManager. Resolves the
+            DocumentManager for the request's workspace so uploads/archives
+            land in the right per-workspace subdirectory of the input dir.
+        api_key: optional API key for combined-auth gating.
+    """
     # Fresh router per call — see the note above the temp_prefix constant.
     router = APIRouter(
         prefix="/documents",
@@ -2127,12 +2137,17 @@ def create_document_routes(
         """Resolve the LightRAG instance for this request's workspace."""
         return await get_rag(request)
 
+    def _dm_dep(request: Request) -> DocumentManager:
+        """Resolve the per-workspace DocumentManager for this request."""
+        return get_doc_manager(request)
+
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
     async def scan_for_new_documents(
         background_tasks: BackgroundTasks,
         rag: LightRAG = Depends(_rag_dep),
+        doc_manager: DocumentManager = Depends(_dm_dep),
     ):
         """
         Trigger the scanning process for new documents.
@@ -2162,6 +2177,7 @@ def create_document_routes(
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
         rag: LightRAG = Depends(_rag_dep),
+        doc_manager: DocumentManager = Depends(_dm_dep),
     ):
         """
         Upload a file to the input directory and index it.
@@ -2493,7 +2509,10 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents(rag: LightRAG = Depends(_rag_dep)):
+    async def clear_documents(
+        rag: LightRAG = Depends(_rag_dep),
+        doc_manager: DocumentManager = Depends(_dm_dep),
+    ):
         """
         Clear all documents from the RAG system.
 
@@ -2911,6 +2930,7 @@ def create_document_routes(
         delete_request: DeleteDocRequest,
         background_tasks: BackgroundTasks,
         rag: LightRAG = Depends(_rag_dep),
+        doc_manager: DocumentManager = Depends(_dm_dep),
     ) -> DeleteDocByIdResponse:
         """
         Delete documents and all their associated data by their IDs using background processing.
