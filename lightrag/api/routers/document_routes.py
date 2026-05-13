@@ -501,6 +501,30 @@ class DocStatusResponse(BaseModel):
     )
 
 
+_TOKEN_METADATA_FIELDS = (
+    "llm_token_usage",
+    "embedding_token_usage",
+    "llm_model_name",
+    "embedding_model_name",
+)
+
+
+def _metadata_for_response(
+    metadata: Optional[dict[str, Any]], status: Any
+) -> Optional[dict[str, Any]]:
+    """Strip per-doc token-usage fields from metadata unless the doc is in
+    a terminal PROCESSED state. While a doc is still pending/processing —
+    or has failed — the per-doc trackers can hold partial or stale numbers
+    (especially with MAX_PARALLEL_INSERT>1, where trackers are mutated
+    mid-flight). Exposing those would mislead cost reporting downstream.
+    """
+    if not metadata:
+        return metadata
+    if status == DocStatus.PROCESSED.value or status == DocStatus.PROCESSED:
+        return metadata
+    return {k: v for k, v in metadata.items() if k not in _TOKEN_METADATA_FIELDS}
+
+
 class DocsStatusesResponse(BaseModel):
     """Response model for document statuses
 
@@ -2849,7 +2873,9 @@ def create_document_routes(
                             track_id=doc_status.track_id,
                             chunks_count=doc_status.chunks_count,
                             error_msg=doc_status.error_msg,
-                            metadata=doc_status.metadata,
+                            metadata=_metadata_for_response(
+                                doc_status.metadata, doc_status.status
+                            ),
                             file_path=normalize_file_path(doc_status.file_path),
                         )
                     )
@@ -3120,7 +3146,9 @@ def create_document_routes(
                         track_id=doc_status.track_id,
                         chunks_count=doc_status.chunks_count,
                         error_msg=doc_status.error_msg,
-                        metadata=doc_status.metadata,
+                        metadata=_metadata_for_response(
+                            doc_status.metadata, doc_status.status
+                        ),
                         file_path=normalize_file_path(doc_status.file_path),
                     )
                 )
@@ -3271,7 +3299,7 @@ def create_document_routes(
                         track_id=doc.track_id,
                         chunks_count=doc.chunks_count,
                         error_msg=doc.error_msg,
-                        metadata=doc.metadata,
+                        metadata=_metadata_for_response(doc.metadata, doc.status),
                         file_path=normalize_file_path(doc.file_path),
                     )
                 )
