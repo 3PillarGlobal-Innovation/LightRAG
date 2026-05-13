@@ -98,6 +98,7 @@ from lightrag.utils import (
     Tokenizer,
     TiktokenTokenizer,
     EmbeddingFunc,
+    TokenTracker,
     always_get_an_event_loop,
     compute_mdhash_id,
     lazy_external_import,
@@ -1896,6 +1897,47 @@ class LightRAG:
                     chunks: dict[str, Any] = {}
                     content_data: dict[str, Any] | None = None
 
+                    # Per-doc indexing token trackers. Captures the LLM and
+                    # embedding usage spent indexing this one document so the
+                    # cost can be attributed downstream.
+                    #
+                    # IMPORTANT: we wrap llm_model_func with a *closure*, not
+                    # functools.partial. extract_entities reads the func via
+                    # `global_config = asdict(self)`, and `asdict` deep-copies
+                    # non-dataclass values — which would clone the partial's
+                    # `keywords` dict (including the TokenTracker), sending the
+                    # actual usage updates into a clone instead of our tracker.
+                    # Closures are deepcopy-immortal in Python, so the
+                    # `doc_llm_tracker` reference inside the closure survives.
+                    #
+                    # CAVEAT: with max_parallel_insert > 1, multiple docs share
+                    # these mutable hooks — recorded per-doc usage is
+                    # approximate (totals are correct, per-doc attribution is
+                    # fuzzy). Set MAX_PARALLEL_INSERT=1 for exact accounting.
+                    doc_llm_tracker = TokenTracker()
+                    doc_embedding_tracker = TokenTracker()
+                    original_llm_model_func = self.llm_model_func
+
+                    async def _llm_with_tracker(*args, **kwargs):
+                        kwargs.setdefault("token_tracker", doc_llm_tracker)
+                        return await original_llm_model_func(*args, **kwargs)
+
+                    self.llm_model_func = _llm_with_tracker
+                    embedding_inner = getattr(
+                        self.embedding_func, "__wrapped__", self.embedding_func
+                    )
+                    embedding_inner.token_tracker = doc_embedding_tracker
+
+                    def _doc_token_usage_metadata() -> dict[str, Any]:
+                        return {
+                            "llm_token_usage": doc_llm_tracker.get_usage(),
+                            "embedding_token_usage": doc_embedding_tracker.get_usage(),
+                            "llm_model_name": self.llm_model_name,
+                            "embedding_model_name": getattr(
+                                embedding_inner, "model_name", None
+                            ),
+                        }
+
                     def get_failed_chunk_snapshot() -> tuple[list[str], int]:
                         if chunks:
                             chunk_ids = list(chunks.keys())
@@ -2121,6 +2163,7 @@ class LightRAG:
                                         "metadata": {
                                             "processing_start_time": processing_start_time,
                                             "processing_end_time": processing_end_time,
+                                            **_doc_token_usage_metadata(),
                                         },
                                     }
                                 }
@@ -2178,6 +2221,7 @@ class LightRAG:
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
+                                                **_doc_token_usage_metadata(),
                                             },
                                         }
                                     }
@@ -2253,10 +2297,20 @@ class LightRAG:
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
+                                                **_doc_token_usage_metadata(),
                                             },
                                         }
                                     }
                                 )
+
+                    # Restore the original llm_model_func and clear the embedding
+                    # tracker now that this document is done. Done at the end of
+                    # process_document so the trackers don't leak across docs.
+                    # (The inner try/except blocks handle all expected failures,
+                    # so this point is reached on both success and handled
+                    # failure paths.)
+                    self.llm_model_func = original_llm_model_func
+                    embedding_inner.token_tracker = None
 
                 # Create processing tasks for all documents
                 doc_tasks = []
@@ -2911,6 +2965,32 @@ class LightRAG:
 
         global_config = asdict(self)
 
+        # Per-request token trackers. The LLM tracker is injected by wrapping
+        # llm_model_func via partial — any call through the wrapped func gets
+        # token_tracker=... passed to the provider, which records usage. The
+        # embedding tracker attaches to the live EmbeddingFunc wrapper for the
+        # duration of the query and is reset in `finally`.
+        llm_tracker = TokenTracker()
+        embedding_tracker = TokenTracker()
+
+        original_llm_func = global_config["llm_model_func"]
+        global_config["llm_model_func"] = partial(
+            original_llm_func, token_tracker=llm_tracker
+        )
+        if param.model_func is not None:
+            param = replace(param, model_func=partial(param.model_func, token_tracker=llm_tracker))
+
+        embedding_inner = getattr(self.embedding_func, "__wrapped__", self.embedding_func)
+        embedding_inner.token_tracker = embedding_tracker
+
+        def _build_token_usage_block() -> dict[str, Any]:
+            return {
+                "token_usage": llm_tracker.get_usage(),
+                "embedding_token_usage": embedding_tracker.get_usage(),
+                "model_name": self.llm_model_name,
+                "embedding_model_name": getattr(embedding_inner, "model_name", None),
+            }
+
         try:
             query_result = None
 
@@ -2961,6 +3041,7 @@ class LightRAG:
                             "response_iterator": None,
                             "is_streaming": False,
                         },
+                        **_build_token_usage_block(),
                     }
                 else:
                     return {
@@ -2973,6 +3054,7 @@ class LightRAG:
                             "response_iterator": response,
                             "is_streaming": True,
                         },
+                        **_build_token_usage_block(),
                     }
             else:
                 raise ValueError(f"Unknown mode {param.mode}")
@@ -2994,6 +3076,7 @@ class LightRAG:
                         "response_iterator": None,
                         "is_streaming": False,
                     },
+                    **_build_token_usage_block(),
                 }
 
             # Extract structured data from query result
@@ -3007,6 +3090,7 @@ class LightRAG:
                 else None,
                 "is_streaming": query_result.is_streaming,
             }
+            raw_data.update(_build_token_usage_block())
 
             return raw_data
 
@@ -3023,7 +3107,12 @@ class LightRAG:
                     "response_iterator": None,
                     "is_streaming": False,
                 },
+                **_build_token_usage_block(),
             }
+        finally:
+            # Detach the embedding tracker so future requests don't accidentally
+            # share usage state through the shared EmbeddingFunc wrapper.
+            embedding_inner.token_tracker = None
 
     def query_llm(
         self,
