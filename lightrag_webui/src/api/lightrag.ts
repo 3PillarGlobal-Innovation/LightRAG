@@ -344,6 +344,7 @@ axiosInstance.interceptors.request.use((config) => {
 
   const apiKey = useSettingsStore.getState().apiKey
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  const workspace = useSettingsStore.getState().workspace
 
   // Always include token if it exists, regardless of path
   if (token) {
@@ -351,6 +352,12 @@ axiosInstance.interceptors.request.use((config) => {
   }
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
+  }
+  // Per-request workspace routing. Empty string falls through to the
+  // server's WORKSPACE env var (e.g. platform_docs). Server sanitizes the
+  // header to [a-zA-Z0-9_], so a stray invalid char is harmless.
+  if (workspace) {
+    config.headers['LIGHTRAG-WORKSPACE'] = workspace
   }
   return config
 })
@@ -486,6 +493,20 @@ export const checkHealth = async (): Promise<
       message: errorMessage(error)
     }
   }
+}
+
+export type WorkspaceInfo = { workspace: string; doc_count: number | null }
+
+/**
+ * Fetch the list of workspaces that currently have indexed docs. Backed by
+ * the server's /workspaces endpoint, which is a meta endpoint — it ignores
+ * the LIGHTRAG-WORKSPACE header on the request and returns all workspaces
+ * known to the storage layer.
+ */
+export const getWorkspaces = async (): Promise<WorkspaceInfo[]> => {
+  const response = await axiosInstance.get('/workspaces')
+  const list = response?.data?.workspaces
+  return Array.isArray(list) ? list : []
 }
 
 export const getDocuments = async (): Promise<DocsStatusesResponse> => {

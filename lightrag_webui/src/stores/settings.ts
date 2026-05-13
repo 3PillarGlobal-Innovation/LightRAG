@@ -66,6 +66,13 @@ interface SettingsState {
   apiKey: string | null
   setApiKey: (key: string | null) => void
 
+  // Workspace selection — sent as the LIGHTRAG-WORKSPACE header on every API
+  // request. Empty string falls through to the server's args.workspace
+  // (e.g. WORKSPACE=platform_docs). Use values like "platform_docs" or
+  // "solution_42" to view those workspaces' data.
+  workspace: string
+  setWorkspace: (workspace: string) => void
+
   // App settings
   theme: Theme
   setTheme: (theme: Theme) => void
@@ -113,6 +120,8 @@ const useSettingsStoreBase = create<SettingsState>()(
       enableHealthCheck: true,
 
       apiKey: null,
+
+      workspace: '',
 
       currentTab: 'documents',
       showFileName: false,
@@ -183,6 +192,8 @@ const useSettingsStoreBase = create<SettingsState>()(
       setEnableHealthCheck: (enable: boolean) => set({ enableHealthCheck: enable }),
 
       setApiKey: (apiKey: string | null) => set({ apiKey }),
+
+      setWorkspace: (workspace: string) => set({ workspace: workspace.trim() }),
 
       setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
 

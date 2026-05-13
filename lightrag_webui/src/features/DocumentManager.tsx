@@ -307,6 +307,7 @@ export default function DocumentManager() {
   const setShowFileName = useSettingsStore.use.setShowFileName()
   const documentsPageSize = useSettingsStore.use.documentsPageSize()
   const setDocumentsPageSize = useSettingsStore.use.setDocumentsPageSize()
+  const workspace = useSettingsStore.use.workspace()
 
   // New pagination state
   const [currentPageDocs, setCurrentPageDocs] = useState<DocStatusResponse[]>([])
@@ -1000,6 +1001,18 @@ export default function DocumentManager() {
   useEffect(() => {
     latestRefreshRequestVersionRef.current += 1
   }, [pagination.page, pagination.page_size, statusFilter, sortField, sortDirection])
+
+  // Workspace switch — refetch the document list immediately so the table
+  // reflects the newly-selected workspace's data. Without this, the API
+  // calls go out with the new LIGHTRAG-WORKSPACE header but the UI still
+  // shows the previous workspace's docs until the user does something
+  // else that triggers a refresh.
+  useEffect(() => {
+    if (currentTab === 'documents' && health && isMountedRef.current) {
+      handleIntelligentRefresh()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace])
 
   // Monitor pipelineBusy changes and trigger immediate refresh with timer reset
   useEffect(() => {
