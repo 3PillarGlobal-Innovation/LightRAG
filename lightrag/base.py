@@ -19,7 +19,6 @@ from typing import (
 from .utils import EmbeddingFunc
 from .types import KnowledgeGraph
 from .constants import (
-    GRAPH_FIELD_SEP,
     DEFAULT_TOP_K,
     DEFAULT_CHUNK_TOP_K,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -163,10 +162,6 @@ class QueryParam:
     Default is True to enable reranking when rerank model is available.
     """
 
-    ids: list[str] | None = None
-    """List of document IDs to filter the query results. If provided, only chunks, entities,
-    and relationships associated with these document IDs will be considered in the search results."""
-
     include_references: bool = False
     """If True, includes reference list in the response for supported endpoints.
     This parameter controls whether the API response includes a references field
@@ -224,6 +219,44 @@ class BaseVectorStorage(StorageNameSpace, ABC):
     embedding_func: EmbeddingFunc
     cosine_better_than_threshold: float = field(default=0.2)
     meta_fields: set[str] = field(default_factory=set)
+
+    def _validate_embedding_func(self):
+        """Validate that embedding_func is provided.
+
+        This method should be called at the beginning of __post_init__
+        in all vector storage implementations.
+
+        Raises:
+            ValueError: If embedding_func is None
+        """
+        if self.embedding_func is None:
+            raise ValueError(
+                "embedding_func is required for vector storage. "
+                "Please provide a valid EmbeddingFunc instance."
+            )
+
+    def _generate_collection_suffix(self) -> str | None:
+        """Generates collection/table suffix from embedding_func.
+
+        Return suffix if model_name exists in embedding_func, otherwise return None.
+        Note: embedding_func is guaranteed to exist (validated in __post_init__).
+
+        Returns:
+            str | None: Suffix string e.g. "text_embedding_3_large_3072d", or None if model_name not available
+        """
+        import re
+
+        # Check if model_name exists (model_name is optional in EmbeddingFunc)
+        model_name = getattr(self.embedding_func, "model_name", None)
+        if not model_name:
+            return None
+
+        # embedding_dim is required in EmbeddingFunc
+        embedding_dim = self.embedding_func.embedding_dim
+
+        # Generate suffix: clean model name and append dimension
+        safe_model_name = re.sub(r"[^a-zA-Z0-9_]", "_", model_name.lower())
+        return f"{safe_model_name}_{embedding_dim}d"
 
     @abstractmethod
     async def query(
@@ -357,6 +390,14 @@ class BaseKVStorage(StorageNameSpace, ABC):
 
         Returns:
             None
+        """
+
+    @abstractmethod
+    async def is_empty(self) -> bool:
+        """Check if the storage is empty
+
+        Returns:
+            bool: True if storage contains no data, False otherwise
         """
 
 
@@ -525,56 +566,6 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         return result
 
     @abstractmethod
-    async def get_nodes_by_chunk_ids(self, chunk_ids: list[str]) -> list[dict]:
-        """Get all nodes that are associated with the given chunk_ids.
-
-        Args:
-            chunk_ids (list[str]): A list of chunk IDs to find associated nodes for.
-
-        Returns:
-            list[dict]: A list of nodes, where each node is a dictionary of its properties.
-                        An empty list if no matching nodes are found.
-        """
-
-    @abstractmethod
-    async def get_edges_by_chunk_ids(self, chunk_ids: list[str]) -> list[dict]:
-        """Get all edges that are associated with the given chunk_ids.
-
-        Args:
-            chunk_ids (list[str]): A list of chunk IDs to find associated edges for.
-
-        Returns:
-            list[dict]: A list of edges, where each edge is a dictionary of its properties.
-                        An empty list if no matching edges are found.
-        """
-        # Default implementation iterates through all nodes and their edges, which is inefficient.
-        # This method should be overridden by subclasses for better performance.
-        all_edges = []
-        all_labels = await self.get_all_labels()
-        processed_edges = set()
-
-        for label in all_labels:
-            edges = await self.get_node_edges(label)
-            if edges:
-                for src_id, tgt_id in edges:
-                    # Avoid processing the same edge twice in an undirected graph
-                    edge_tuple = tuple(sorted((src_id, tgt_id)))
-                    if edge_tuple in processed_edges:
-                        continue
-                    processed_edges.add(edge_tuple)
-
-                    edge = await self.get_edge(src_id, tgt_id)
-                    if edge and "source_id" in edge:
-                        source_ids = set(edge["source_id"].split(GRAPH_FIELD_SEP))
-                        if not source_ids.isdisjoint(chunk_ids):
-                            # Add source and target to the edge dict for easier processing later
-                            edge_with_nodes = edge.copy()
-                            edge_with_nodes["source"] = src_id
-                            edge_with_nodes["target"] = tgt_id
-                            all_edges.append(edge_with_nodes)
-        return all_edges
-
-    @abstractmethod
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """Insert a new node or update an existing node in the graph.
 
@@ -587,6 +578,53 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             node_id: The ID of the node to insert or update
             node_data: A dictionary of node properties
         """
+
+    async def upsert_nodes_batch(self, nodes: list[tuple[str, dict[str, str]]]) -> None:
+        """Insert or update multiple nodes in a single batch call.
+
+        Default implementation falls back to calling upsert_node() serially.
+        Override in storage backends that support native batch operations for
+        better performance when importing large knowledge graphs.
+
+        Args:
+            nodes: List of (node_id, node_data) tuples.
+        """
+        for node_id, node_data in nodes:
+            await self.upsert_node(node_id, node_data=node_data)
+
+    async def has_nodes_batch(self, node_ids: list[str]) -> set[str]:
+        """Check existence of multiple nodes in a single batch call.
+
+        Default implementation falls back to calling has_node() serially.
+        Override in storage backends that support native batch operations for
+        better performance when importing large knowledge graphs.
+
+        Args:
+            node_ids: List of node IDs to check.
+
+        Returns:
+            Set of node_ids that exist in the graph.
+        """
+        existing: set[str] = set()
+        for node_id in node_ids:
+            if await self.has_node(node_id):
+                existing.add(node_id)
+        return existing
+
+    async def upsert_edges_batch(
+        self, edges: list[tuple[str, str, dict[str, str]]]
+    ) -> None:
+        """Insert or update multiple edges in a single batch call.
+
+        Default implementation falls back to calling upsert_edge() serially.
+        Override in storage backends that support native batch operations for
+        better performance when importing large knowledge graphs.
+
+        Args:
+            edges: List of (source_node_id, target_node_id, edge_data) tuples.
+        """
+        for source_node_id, target_node_id, edge_data in edges:
+            await self.upsert_edge(source_node_id, target_node_id, edge_data=edge_data)
 
     @abstractmethod
     async def upsert_edge(
@@ -644,10 +682,10 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             edges: List of edges to be deleted, each edge is a (source, target) tuple
         """
 
-    # TODO: deprecated
     @abstractmethod
     async def get_all_labels(self) -> list[str]:
-        """Get all labels in the graph.
+        """Get all labels(entity names) in the graph.
+        Do not use this method for large graph, use get_popular_labels or search_labels instead.
 
         Returns:
             A list of all node labels in the graph, sorted alphabetically
@@ -661,7 +699,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
 
         Args:
-            node_label: Label of the starting node，* means all nodes
+            node_label: Label(entity name) of the starting node，* means all nodes
             max_depth: Maximum depth of the subgraph, Defaults to 3
             max_nodes: Maxiumu nodes to return, Defaults to 1000（BFS if possible)
 
@@ -689,7 +727,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
     @abstractmethod
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
-        """Get popular labels by node degree (most connected entities)
+        """Get popular labels(entity names) by node degree (most connected entities)
 
         Args:
             limit: Maximum number of labels to return
@@ -700,7 +738,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
     @abstractmethod
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
-        """Search labels with fuzzy matching
+        """Search labels(entity names) with fuzzy matching
 
         Args:
             query: Search query string
@@ -716,6 +754,7 @@ class DocStatus(str, Enum):
 
     PENDING = "pending"
     PROCESSING = "processing"
+    PREPROCESSED = "preprocessed"
     PROCESSED = "processed"
     FAILED = "failed"
 
@@ -746,6 +785,25 @@ class DocProcessingStatus:
     """Error message if failed"""
     metadata: dict[str, Any] = field(default_factory=dict)
     """Additional metadata"""
+    multimodal_processed: bool | None = field(default=None, repr=False)
+    """Internal field: indicates if multimodal processing is complete. Not shown in repr() but accessible for debugging."""
+
+    def __post_init__(self):
+        """
+        Handle status conversion based on multimodal_processed field.
+
+        Business rules:
+        - If multimodal_processed is False and status is PROCESSED,
+          then change status to PREPROCESSED
+        - The multimodal_processed field is kept (with repr=False) for internal use and debugging
+        """
+        # Apply status conversion logic
+        if self.multimodal_processed is not None:
+            if (
+                self.multimodal_processed is False
+                and self.status == DocStatus.PROCESSED
+            ):
+                self.status = DocStatus.PREPROCESSED
 
 
 @dataclass
@@ -761,6 +819,12 @@ class DocStatusStorage(BaseKVStorage, ABC):
         self, status: DocStatus
     ) -> dict[str, DocProcessingStatus]:
         """Get all documents with a specific status"""
+
+    @abstractmethod
+    async def get_docs_by_statuses(
+        self, statuses: list[DocStatus]
+    ) -> dict[str, DocProcessingStatus]:
+        """Get all documents matching any of the given statuses"""
 
     @abstractmethod
     async def get_docs_by_track_id(
@@ -824,7 +888,7 @@ class StoragesStatus(str, Enum):
 class DeletionResult:
     """Represents the result of a deletion operation."""
 
-    status: Literal["success", "not_found", "fail"]
+    status: Literal["success", "not_found", "not_allowed", "fail"]
     doc_id: str
     message: str
     status_code: int = 200
@@ -844,14 +908,12 @@ class QueryResult:
         response_iterator: Streaming response iterator for streaming responses
         raw_data: Complete structured data including references and metadata
         is_streaming: Whether this is a streaming result
-        token_usage: Token usage statistics from LLM calls (prompt_tokens, completion_tokens, total_tokens, call_count)
     """
 
     content: Optional[str] = None
     response_iterator: Optional[AsyncIterator[str]] = None
     raw_data: Optional[Dict[str, Any]] = None
     is_streaming: bool = False
-    token_usage: Optional[Dict[str, int]] = None
 
     @property
     def reference_list(self) -> List[Dict[str, str]]:

@@ -58,24 +58,25 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
 
 ---Examples---
 {examples}
-
----Real Data to be Processed---
-<Input>
-Entity_types: [{entity_types}]
-Text:
-```
-{input_text}
-```
 """
 
 PROMPTS["entity_extraction_user_prompt"] = """---Task---
-Extract entities and relationships from the input text to be processed.
+Extract entities and relationships from the input text in Data to be Processed below.
 
 ---Instructions---
 1.  **Strict Adherence to Format:** Strictly adhere to all format requirements for entity and relationship lists, including output order, field delimiters, and proper noun handling, as specified in the system prompt.
 2.  **Output Content Only:** Output *only* the extracted list of entities and relationships. Do not include any introductory or concluding remarks, explanations, or additional text before or after the list.
 3.  **Completion Signal:** Output `{completion_delimiter}` as the final line after all relevant entities and relationships have been extracted and presented.
 4.  **Output Language:** Ensure the output language is {language}. Proper nouns (e.g., personal names, place names, organization names) must be kept in their original language and not translated.
+
+---Data to be Processed---
+<Entity_types>
+[{entity_types}]
+
+<Input Text>
+```
+{input_text}
+```
 
 <Output>
 """
@@ -99,7 +100,10 @@ Based on the last extraction task, identify and extract any **missed or incorrec
 """
 
 PROMPTS["entity_extraction_examples"] = [
-    """<Input Text>
+    """<Entity_types>
+["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+
+<Input Text>
 ```
 while Alex clenched his jaw, the buzz of frustration dull against the backdrop of Taylor's authoritarian certainty. It was this competitive undercurrent that kept him alert, the sense that his and Jordan's shared commitment to discovery was an unspoken rebellion against Cruz's narrowing vision of control and order.
 
@@ -115,7 +119,7 @@ entity{tuple_delimiter}Alex{tuple_delimiter}person{tuple_delimiter}Alex is a cha
 entity{tuple_delimiter}Taylor{tuple_delimiter}person{tuple_delimiter}Taylor is portrayed with authoritarian certainty and shows a moment of reverence towards a device, indicating a change in perspective.
 entity{tuple_delimiter}Jordan{tuple_delimiter}person{tuple_delimiter}Jordan shares a commitment to discovery and has a significant interaction with Taylor regarding a device.
 entity{tuple_delimiter}Cruz{tuple_delimiter}person{tuple_delimiter}Cruz is associated with a vision of control and order, influencing the dynamics among other characters.
-entity{tuple_delimiter}The Device{tuple_delimiter}equiment{tuple_delimiter}The Device is central to the story, with potential game-changing implications, and is revered by Taylor.
+entity{tuple_delimiter}The Device{tuple_delimiter}equipment{tuple_delimiter}The Device is central to the story, with potential game-changing implications, and is revered by Taylor.
 relation{tuple_delimiter}Alex{tuple_delimiter}Taylor{tuple_delimiter}power dynamics, observation{tuple_delimiter}Alex observes Taylor's authoritarian behavior and notes changes in Taylor's attitude toward the device.
 relation{tuple_delimiter}Alex{tuple_delimiter}Jordan{tuple_delimiter}shared goals, rebellion{tuple_delimiter}Alex and Jordan share a commitment to discovery, which contrasts with Cruz's vision.)
 relation{tuple_delimiter}Taylor{tuple_delimiter}Jordan{tuple_delimiter}conflict resolution, mutual respect{tuple_delimiter}Taylor and Jordan interact directly regarding the device, leading to a moment of mutual respect and an uneasy truce.
@@ -124,7 +128,10 @@ relation{tuple_delimiter}Taylor{tuple_delimiter}The Device{tuple_delimiter}rever
 {completion_delimiter}
 
 """,
-    """<Input Text>
+    """<Entity_types>
+["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+
+<Input Text>
 ```
 Stock markets faced a sharp downturn today as tech giants saw significant declines, with the global tech index dropping by 3.4% in midday trading. Analysts attribute the selloff to investor concerns over rising interest rates and regulatory uncertainty.
 
@@ -151,7 +158,10 @@ relation{tuple_delimiter}Federal Reserve Policy Announcement{tuple_delimiter}Mar
 {completion_delimiter}
 
 """,
-    """<Input Text>
+    """<Entity_types>
+["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+
+<Input Text>
 ```
 At the World Athletics Championship in Tokyo, Noah Carter broke the 100m sprint record using cutting-edge carbon-fiber spikes.
 ```
@@ -223,32 +233,32 @@ Consider the conversation history if provided to maintain conversational flow an
 
 ---Instructions---
 
-**1. Step-by-Step Instruction:**
+1. Step-by-Step Instruction:
   - Carefully determine the user's query intent in the context of the conversation history to fully understand the user's information need.
   - Scrutinize both `Knowledge Graph Data` and `Document Chunks` in the **Context**. Identify and extract all pieces of information that are directly relevant to answering the user query.
   - Weave the extracted facts into a coherent and logical response. Your own knowledge must ONLY be used to formulate fluent sentences and connect ideas, NOT to introduce any external information.
   - Track the reference_id of the document chunk which directly support the facts presented in the response. Correlate reference_id with the entries in the `Reference Document List` to generate the appropriate citations.
-  - Generate a **References** section at the end of the response. Each reference document must directly support the facts presented in the response.
+  - Generate a references section at the end of the response. Each reference document must directly support the facts presented in the response.
   - Do not generate anything after the reference section.
 
-**2. Content & Grounding:**
+2. Content & Grounding:
   - Strictly adhere to the provided context from the **Context**; DO NOT invent, assume, or infer any information not explicitly stated.
   - If the answer cannot be found in the **Context**, state that you do not have enough information to answer. Do not attempt to guess.
 
-**3. Formatting & Language:**
+3. Formatting & Language:
   - The response MUST be in the same language as the user query.
   - The response MUST utilize Markdown formatting for enhanced clarity and structure (e.g., headings, bold text, bullet points).
   - The response should be presented in {response_type}.
 
-**4. References Section Format:**
+4. References Section Format:
   - The References section should be under heading: `### References`
   - Reference list entries should adhere to the format: `* [n] Document Title`. Do not include a caret (`^`) after opening square bracket (`[`).
   - The Document Title in the citation must retain its original language.
   - Output each citation on an individual line
   - Provide maximum of 5 most relevant citations.
-  - Do not generate footnotes section or any text after the references.
+  - Do not generate footnotes section or any comment, summary, or explanation after the references.
 
-**5. Reference Section Example:**
+5. Reference Section Example:
 ```
 ### References
 
@@ -257,7 +267,7 @@ Consider the conversation history if provided to maintain conversational flow an
 - [3] Document Title Three
 ```
 
-**6. Additional Instructions**: {user_prompt}
+6. Additional Instructions: {user_prompt}
 
 
 ---Context---
@@ -277,7 +287,7 @@ Consider the conversation history if provided to maintain conversational flow an
 
 ---Instructions---
 
-**1. Think Step-by-Step:**
+1. Step-by-Step Instruction:
   - Carefully determine the user's query intent in the context of the conversation history to fully understand the user's information need.
   - Scrutinize `Document Chunks` in the **Context**. Identify and extract all pieces of information that are directly relevant to answering the user query.
   - Weave the extracted facts into a coherent and logical response. Your own knowledge must ONLY be used to formulate fluent sentences and connect ideas, NOT to introduce any external information.
@@ -285,24 +295,24 @@ Consider the conversation history if provided to maintain conversational flow an
   - Generate a **References** section at the end of the response. Each reference document must directly support the facts presented in the response.
   - Do not generate anything after the reference section.
 
-**2. Content & Grounding:**
+2. Content & Grounding:
   - Strictly adhere to the provided context from the **Context**; DO NOT invent, assume, or infer any information not explicitly stated.
   - If the answer cannot be found in the **Context**, state that you do not have enough information to answer. Do not attempt to guess.
 
-**3. Formatting & Language:**
+3. Formatting & Language:
   - The response MUST be in the same language as the user query.
   - The response MUST utilize Markdown formatting for enhanced clarity and structure (e.g., headings, bold text, bullet points).
   - The response should be presented in {response_type}.
 
-**4. References Section Format:**
+4. References Section Format:
   - The References section should be under heading: `### References`
   - Reference list entries should adhere to the format: `* [n] Document Title`. Do not include a caret (`^`) after opening square bracket (`[`).
   - The Document Title in the citation must retain its original language.
   - Output each citation on an individual line
   - Provide maximum of 5 most relevant citations.
-  - Do not generate footnotes section or any text after the references.
+  - Do not generate footnotes section or any comment, summary, or explanation after the references.
 
-**5. Reference Section Example:**
+5. Reference Section Example:
 ```
 ### References
 
@@ -311,7 +321,7 @@ Consider the conversation history if provided to maintain conversational flow an
 - [3] Document Title Three
 ```
 
-**6. Additional Instructions**: {user_prompt}
+6. Additional Instructions: {user_prompt}
 
 
 ---Context---
@@ -374,6 +384,7 @@ Given a user query, your task is to extract two distinct types of keywords:
 2. **Source of Truth**: All keywords must be explicitly derived from the user query, with both high-level and low-level keyword categories are required to contain content.
 3. **Concise & Meaningful**: Keywords should be concise words or meaningful phrases. Prioritize multi-word phrases when they represent a single concept. For example, from "latest financial report of Apple Inc.", you should extract "latest financial report" and "Apple Inc." rather than "latest", "financial", "report", and "Apple".
 4. **Handle Edge Cases**: For queries that are too simple, vague, or nonsensical (e.g., "hello", "ok", "asdfghjkl"), you must return a JSON object with empty lists for both keyword types.
+5. **Language**: All extracted keywords MUST be in {language}. Proper nouns (e.g., personal names, place names, organization names) should be kept in their original language.
 
 ---Examples---
 {examples}

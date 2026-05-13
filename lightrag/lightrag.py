@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import traceback
 import asyncio
-import configparser
+import inspect
 import os
 import time
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Iterator,
     cast,
@@ -20,7 +21,10 @@ from typing import (
     Optional,
     List,
     Dict,
+    Union,
 )
+from lightrag.prompt import PROMPTS
+from lightrag.exceptions import PipelineCancelledException
 from lightrag.constants import (
     DEFAULT_MAX_GLEANING,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
@@ -36,13 +40,19 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
+    DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
     DEFAULT_MAX_ASYNC,
     DEFAULT_MAX_PARALLEL_INSERT,
     DEFAULT_MAX_GRAPH_NODES,
+    DEFAULT_MAX_SOURCE_IDS_PER_ENTITY,
+    DEFAULT_MAX_SOURCE_IDS_PER_RELATION,
     DEFAULT_ENTITY_TYPES,
     DEFAULT_SUMMARY_LANGUAGE,
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_EMBEDDING_TIMEOUT,
+    DEFAULT_SOURCE_IDS_LIMIT_METHOD,
+    DEFAULT_MAX_FILE_PATHS,
+    DEFAULT_FILE_PATH_MORE_PLACEHOLDER,
 )
 from lightrag.utils import get_env_value
 
@@ -54,9 +64,10 @@ from lightrag.kg import (
 
 from lightrag.kg.shared_storage import (
     get_namespace_data,
-    get_pipeline_status_lock,
-    get_graph_db_lock,
     get_data_init_lock,
+    get_default_workspace,
+    set_default_workspace,
+    get_namespace_lock,
 )
 
 from lightrag.base import (
@@ -80,14 +91,14 @@ from lightrag.operate import (
     merge_nodes_and_edges,
     kg_query,
     naive_query,
-    _rebuild_knowledge_from_chunks,
+    rebuild_knowledge_from_chunks,
 )
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import (
     Tokenizer,
     TiktokenTokenizer,
-    TokenTracker,
     EmbeddingFunc,
+    TokenTracker,
     always_get_an_event_loop,
     compute_mdhash_id,
     lazy_external_import,
@@ -98,6 +109,10 @@ from lightrag.utils import (
     generate_track_id,
     convert_to_user_format,
     logger,
+    make_relation_vdb_ids,
+    subtract_source_ids,
+    make_relation_chunk_key,
+    normalize_source_ids_limit_method,
 )
 from lightrag.types import KnowledgeGraph
 from dotenv import load_dotenv
@@ -107,9 +122,88 @@ from dotenv import load_dotenv
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
 
-# TODO: TO REMOVE @Yannick
-config = configparser.ConfigParser()
-config.read("config.ini", "utf-8")
+
+def _chunk_fields_from_status_doc(
+    status_doc: "DocProcessingStatus",
+) -> tuple[list[str], int]:
+    """Return (chunks_list, chunks_count) preserved from a status document.
+
+    Filters out any non-string or empty chunk IDs.  When chunks_count is
+    absent or invalid, it is inferred from the length of chunks_list.
+    """
+    chunks_list: list[str] = []
+    if isinstance(status_doc.chunks_list, list):
+        chunks_list = [
+            chunk_id
+            for chunk_id in status_doc.chunks_list
+            if isinstance(chunk_id, str) and chunk_id
+        ]
+
+    if isinstance(status_doc.chunks_count, int) and status_doc.chunks_count >= 0:
+        return chunks_list, status_doc.chunks_count
+
+    return chunks_list, len(chunks_list)
+
+
+def _resolve_doc_file_path(
+    status_doc: "DocProcessingStatus" | None = None,
+    content_data: dict[str, Any] | None = None,
+) -> str:
+    """Resolve the best available document file path.
+
+    Prefer a non-placeholder path from doc_status, then fall back to full_docs.
+    This avoids overwriting historical file paths with placeholder values during
+    retries or early-cancellation paths.
+    """
+
+    placeholder_paths = {"", "no-file-path", "unknown_source"}
+
+    def _normalize_path(candidate: Any) -> str | None:
+        if not isinstance(candidate, str):
+            return None
+
+        normalized = candidate.strip()
+        if not normalized:
+            return None
+
+        return normalized
+
+    candidates = [
+        _normalize_path(getattr(status_doc, "file_path", None)),
+        _normalize_path(content_data.get("file_path") if content_data else None),
+    ]
+
+    for candidate in candidates:
+        if candidate and candidate not in placeholder_paths:
+            return candidate
+
+    for candidate in candidates:
+        if candidate:
+            return "unknown_source" if candidate == "no-file-path" else candidate
+
+    return "unknown_source"
+
+
+def _normalize_string_list(raw_values: Any, context: str = "") -> list[str]:
+    """Return a list of non-empty strings from raw_values.
+
+    Non-string elements are dropped and logged as warnings. If raw_values is
+    not a list, an empty list is returned.
+    """
+    if not isinstance(raw_values, list):
+        return []
+    result = []
+    for i, value in enumerate(raw_values):
+        if isinstance(value, str) and value:
+            result.append(value)
+        else:
+            logger.warning(
+                "Non-string element dropped from list%s at index %d: %r",
+                f" ({context})" if context else "",
+                i,
+                value,
+            )
+    return result
 
 
 @final
@@ -144,8 +238,8 @@ class LightRAG:
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
 
-    # Logging (Deprecated, use setup_logger in utils.py instead)
     # ---
+    # TODO: Deprecated, use setup_logger in utils.py instead
     log_level: int | None = field(default=None)
     log_file_path: str | None = field(default=None)
 
@@ -198,6 +292,13 @@ class LightRAG:
     )
     """Maximum number of entity extraction attempts for ambiguous content."""
 
+    max_extract_input_tokens: int = field(
+        default=get_env_value(
+            "MAX_EXTRACT_INPUT_TOKENS", DEFAULT_MAX_EXTRACT_INPUT_TOKENS, int
+        )
+    )
+    """Maximum tokens allowed for entity extraction input context."""
+
     force_llm_summary_on_merge: int = field(
         default=get_env_value(
             "FORCE_LLM_SUMMARY_ON_MERGE", DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE, int
@@ -234,10 +335,12 @@ class LightRAG:
             int,
             int,
         ],
-        List[Dict[str, Any]],
+        Union[List[Dict[str, Any]], Awaitable[List[Dict[str, Any]]]],
     ] = field(default_factory=lambda: chunking_by_token_size)
     """
     Custom chunking function for splitting text into chunks before processing.
+
+    The function can be either synchronous or asynchronous.
 
     The function should take the following parameters:
 
@@ -245,12 +348,15 @@ class LightRAG:
         - `content`: The text to be split into chunks.
         - `split_by_character`: The character to split the text on. If None, the text is split into chunks of `chunk_token_size` tokens.
         - `split_by_character_only`: If True, the text is split only on the specified character.
-        - `chunk_token_size`: The maximum number of tokens per chunk.
         - `chunk_overlap_token_size`: The number of overlapping tokens between consecutive chunks.
+        - `chunk_token_size`: The maximum number of tokens per chunk.
 
-    The function should return a list of dictionaries, where each dictionary contains the following keys:
-        - `tokens`: The number of tokens in the chunk.
-        - `content`: The text content of the chunk.
+
+    The function should return a list of dictionaries (or an awaitable that resolves to a list),
+    where each dictionary contains the following keys:
+        - `tokens` (int): The number of tokens in the chunk.
+        - `content` (str): The text content of the chunk.
+        - `chunk_order_index` (int): Zero-based index indicating the chunk's order in the document.
 
     Defaults to `chunking_by_token_size` if not specified.
     """
@@ -260,6 +366,9 @@ class LightRAG:
 
     embedding_func: EmbeddingFunc | None = field(default=None)
     """Function for computing text embeddings. Must be set before use."""
+
+    embedding_token_limit: int | None = field(default=None, init=False)
+    """Token limit for embedding model. Set automatically from embedding_func.max_token_size in __post_init__."""
 
     embedding_batch_num: int = field(default=int(os.getenv("EMBEDDING_BATCH_NUM", 10)))
     """Batch size for embedding computations."""
@@ -359,6 +468,41 @@ class LightRAG:
         default=get_env_value("MAX_GRAPH_NODES", DEFAULT_MAX_GRAPH_NODES, int)
     )
     """Maximum number of graph nodes to return in knowledge graph queries."""
+
+    max_source_ids_per_entity: int = field(
+        default=get_env_value(
+            "MAX_SOURCE_IDS_PER_ENTITY", DEFAULT_MAX_SOURCE_IDS_PER_ENTITY, int
+        )
+    )
+    """Maximum number of source (chunk) ids in entity Grpah + VDB."""
+
+    max_source_ids_per_relation: int = field(
+        default=get_env_value(
+            "MAX_SOURCE_IDS_PER_RELATION",
+            DEFAULT_MAX_SOURCE_IDS_PER_RELATION,
+            int,
+        )
+    )
+    """Maximum number of source (chunk) ids in relation Graph + VDB."""
+
+    source_ids_limit_method: str = field(
+        default_factory=lambda: normalize_source_ids_limit_method(
+            get_env_value(
+                "SOURCE_IDS_LIMIT_METHOD",
+                DEFAULT_SOURCE_IDS_LIMIT_METHOD,
+                str,
+            )
+        )
+    )
+    """Strategy for enforcing source_id limits: IGNORE_NEW or FIFO."""
+
+    max_file_paths: int = field(
+        default=get_env_value("MAX_FILE_PATHS", DEFAULT_MAX_FILE_PATHS, int)
+    )
+    """Maximum number of file paths to store in entity/relation file_path field."""
+
+    file_path_more_placeholder: str = field(default=DEFAULT_FILE_PATH_MORE_PLACEHOLDER)
+    """Placeholder text when file paths exceed max_file_paths limit."""
 
     addon_params: dict[str, Any] = field(
         default_factory=lambda: {
@@ -462,18 +606,37 @@ class LightRAG:
                 f"max_total_tokens({self.summary_max_tokens}) should greater than summary_length_recommended({self.summary_length_recommended})"
             )
 
+        # Init Embedding
+        # Step 1: Capture embedding_func and max_token_size before applying rate_limit decorator
+        original_embedding_func = self.embedding_func
+        embedding_max_token_size = None
+        if self.embedding_func and hasattr(self.embedding_func, "max_token_size"):
+            embedding_max_token_size = self.embedding_func.max_token_size
+            logger.debug(
+                f"Captured embedding max_token_size: {embedding_max_token_size}"
+            )
+        self.embedding_token_limit = embedding_max_token_size
+
         # Fix global_config now
         global_config = asdict(self)
+        # Restore original EmbeddingFunc object (asdict converts it to dict)
+        global_config["embedding_func"] = original_embedding_func
 
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
         logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
 
-        # Init Embedding
-        self.embedding_func = priority_limit_async_func_call(
-            self.embedding_func_max_async,
-            llm_timeout=self.default_embedding_timeout,
-            queue_name="Embedding func",
-        )(self.embedding_func)
+        # Step 2: Apply priority wrapper decorator to EmbeddingFunc's inner func
+        # Create a NEW EmbeddingFunc instance with the wrapped func to avoid mutating the caller's object
+        # This ensures _generate_collection_suffix can still access attributes (model_name, embedding_dim)
+        # while preventing side effects when the same EmbeddingFunc is reused across multiple LightRAG instances
+        if self.embedding_func is not None:
+            wrapped_func = priority_limit_async_func_call(
+                self.embedding_func_max_async,
+                llm_timeout=self.default_embedding_timeout,
+                queue_name="Embedding func",
+            )(self.embedding_func.func)
+            # Use dataclasses.replace() to create a new instance, leaving the original unchanged
+            self.embedding_func = replace(self.embedding_func, func=wrapped_func)
 
         # Initialize all storages
         self.key_string_value_json_storage_cls: type[BaseKVStorage] = (
@@ -525,6 +688,18 @@ class LightRAG:
 
         self.full_relations: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_FULL_RELATIONS,
+            workspace=self.workspace,
+            embedding_func=self.embedding_func,
+        )
+
+        self.entity_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
+            namespace=NameSpace.KV_STORE_ENTITY_CHUNKS,
+            workspace=self.workspace,
+            embedding_func=self.embedding_func,
+        )
+
+        self.relation_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
+            namespace=NameSpace.KV_STORE_RELATION_CHUNKS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
         )
@@ -583,11 +758,29 @@ class LightRAG:
     async def initialize_storages(self):
         """Storage initialization must be called one by one to prevent deadlock"""
         if self._storages_status == StoragesStatus.CREATED:
+            # Set the first initialized workspace will set the default workspace
+            # Allows namespace operation without specifying workspace for backward compatibility
+            default_workspace = get_default_workspace()
+            if default_workspace is None:
+                set_default_workspace(self.workspace)
+            elif default_workspace != self.workspace:
+                logger.info(
+                    f"Creating LightRAG instance with workspace='{self.workspace}' "
+                    f"while default workspace is set to '{default_workspace}'"
+                )
+
+            # Auto-initialize pipeline_status for this workspace
+            from lightrag.kg.shared_storage import initialize_pipeline_status
+
+            await initialize_pipeline_status(workspace=self.workspace)
+
             for storage in (
                 self.full_docs,
                 self.text_chunks,
                 self.full_entities,
                 self.full_relations,
+                self.entity_chunks,
+                self.relation_chunks,
                 self.entities_vdb,
                 self.relationships_vdb,
                 self.chunks_vdb,
@@ -610,6 +803,8 @@ class LightRAG:
                 ("text_chunks", self.text_chunks),
                 ("full_entities", self.full_entities),
                 ("full_relations", self.full_relations),
+                ("entity_chunks", self.entity_chunks),
+                ("relation_chunks", self.relation_chunks),
                 ("entities_vdb", self.entities_vdb),
                 ("relationships_vdb", self.relationships_vdb),
                 ("chunks_vdb", self.chunks_vdb),
@@ -650,7 +845,7 @@ class LightRAG:
 
     async def check_and_migrate_data(self):
         """Check if data migration is needed and perform migration if necessary"""
-        async with get_data_init_lock(enable_logging=True):
+        async with get_data_init_lock():
             try:
                 # Check if migration is needed:
                 # 1. chunk_entity_relation_graph has entities and relations (count > 0)
@@ -664,6 +859,13 @@ class LightRAG:
                 if not all_entity_labels:
                     logger.debug("No entities found in graph, skipping migration check")
                     return
+
+                try:
+                    # Initialize chunk tracking storage after migration
+                    await self._migrate_chunk_tracking_storage()
+                except Exception as e:
+                    logger.error(f"Error during chunk_tracking migration: {e}")
+                    raise e
 
                 # Check if full_entities and full_relations are empty
                 # Get all processed documents to check their entity/relation data
@@ -705,11 +907,11 @@ class LightRAG:
 
                 except Exception as e:
                     logger.error(f"Error during migration check: {e}")
-                    # Don't raise the error, just log it to avoid breaking initialization
+                    raise e
 
             except Exception as e:
                 logger.error(f"Error in data migration check: {e}")
-                # Don't raise the error to avoid breaking initialization
+                raise e
 
     async def _migrate_entity_relation_data(self, processed_docs: dict):
         """Migrate existing entity and relation data to full_entities and full_relations storage"""
@@ -807,6 +1009,140 @@ class LightRAG:
         logger.info(
             f"Data migration completed: migrated {migration_count} documents with entities/relations"
         )
+
+    async def _migrate_chunk_tracking_storage(self) -> None:
+        """Ensure entity/relation chunk tracking KV stores exist and are seeded."""
+
+        if not self.entity_chunks or not self.relation_chunks:
+            return
+
+        need_entity_migration = False
+        need_relation_migration = False
+
+        try:
+            need_entity_migration = await self.entity_chunks.is_empty()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error(f"Failed to check entity chunks storage: {exc}")
+            raise exc
+
+        try:
+            need_relation_migration = await self.relation_chunks.is_empty()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error(f"Failed to check relation chunks storage: {exc}")
+            raise exc
+
+        if not need_entity_migration and not need_relation_migration:
+            return
+
+        BATCH_SIZE = 500  # Process 500 records per batch
+
+        if need_entity_migration:
+            try:
+                nodes = await self.chunk_entity_relation_graph.get_all_nodes()
+            except Exception as exc:
+                logger.error(f"Failed to fetch nodes for chunk migration: {exc}")
+                nodes = []
+
+            logger.info(f"Starting chunk_tracking data migration: {len(nodes)} nodes")
+
+            # Process nodes in batches
+            total_nodes = len(nodes)
+            total_batches = (total_nodes + BATCH_SIZE - 1) // BATCH_SIZE
+            total_migrated = 0
+
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min((batch_idx + 1) * BATCH_SIZE, total_nodes)
+                batch_nodes = nodes[start_idx:end_idx]
+
+                upsert_payload: dict[str, dict[str, object]] = {}
+                for node in batch_nodes:
+                    entity_id = node.get("entity_id") or node.get("id")
+                    if not entity_id:
+                        continue
+
+                    raw_source = node.get("source_id") or ""
+                    chunk_ids = [
+                        chunk_id
+                        for chunk_id in raw_source.split(GRAPH_FIELD_SEP)
+                        if chunk_id
+                    ]
+                    if not chunk_ids:
+                        continue
+
+                    upsert_payload[entity_id] = {
+                        "chunk_ids": chunk_ids,
+                        "count": len(chunk_ids),
+                    }
+
+                if upsert_payload:
+                    await self.entity_chunks.upsert(upsert_payload)
+                    total_migrated += len(upsert_payload)
+                    logger.info(
+                        f"Processed entity batch {batch_idx + 1}/{total_batches}: {len(upsert_payload)} records (total: {total_migrated}/{total_nodes})"
+                    )
+
+            if total_migrated > 0:
+                # Persist entity_chunks data to disk
+                await self.entity_chunks.index_done_callback()
+                logger.info(
+                    f"Entity chunk_tracking migration completed: {total_migrated} records persisted"
+                )
+
+        if need_relation_migration:
+            try:
+                edges = await self.chunk_entity_relation_graph.get_all_edges()
+            except Exception as exc:
+                logger.error(f"Failed to fetch edges for chunk migration: {exc}")
+                edges = []
+
+            logger.info(f"Starting chunk_tracking data migration: {len(edges)} edges")
+
+            # Process edges in batches
+            total_edges = len(edges)
+            total_batches = (total_edges + BATCH_SIZE - 1) // BATCH_SIZE
+            total_migrated = 0
+
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min((batch_idx + 1) * BATCH_SIZE, total_edges)
+                batch_edges = edges[start_idx:end_idx]
+
+                upsert_payload: dict[str, dict[str, object]] = {}
+                for edge in batch_edges:
+                    src = edge.get("source") or edge.get("src_id") or edge.get("src")
+                    tgt = edge.get("target") or edge.get("tgt_id") or edge.get("tgt")
+                    if not src or not tgt:
+                        continue
+
+                    raw_source = edge.get("source_id") or ""
+                    chunk_ids = [
+                        chunk_id
+                        for chunk_id in raw_source.split(GRAPH_FIELD_SEP)
+                        if chunk_id
+                    ]
+                    if not chunk_ids:
+                        continue
+
+                    storage_key = make_relation_chunk_key(src, tgt)
+                    upsert_payload[storage_key] = {
+                        "chunk_ids": chunk_ids,
+                        "count": len(chunk_ids),
+                    }
+
+                if upsert_payload:
+                    await self.relation_chunks.upsert(upsert_payload)
+                    total_migrated += len(upsert_payload)
+                    logger.info(
+                        f"Processed relation batch {batch_idx + 1}/{total_batches}: {len(upsert_payload)} records (total: {total_migrated}/{total_edges})"
+                    )
+
+            if total_migrated > 0:
+                # Persist relation_chunks data to disk
+                await self.relation_chunks.index_done_callback()
+                logger.info(
+                    f"Relation chunk_tracking migration completed: {total_migrated} records persisted"
+                )
 
     async def get_graph_labels(self):
         text = await self.chunk_entity_relation_graph.get_all_labels()
@@ -962,7 +1298,7 @@ class LightRAG:
                 doc_key = compute_mdhash_id(full_text, prefix="doc-")
             else:
                 doc_key = doc_id
-            new_docs = {doc_key: {"content": full_text}}
+            new_docs = {doc_key: {"content": full_text, "file_path": file_path}}
 
             _add_doc_keys = await self.full_docs.filter_keys({doc_key})
             new_docs = {k: v for k, v in new_docs.items() if k in _add_doc_keys}
@@ -1048,6 +1384,10 @@ class LightRAG:
                 raise ValueError(
                     "Number of file paths must match the number of documents"
                 )
+            file_paths = [
+                path.strip() if isinstance(path, str) else "" for path in file_paths
+            ]
+            file_paths = [path if path else "unknown_source" for path in file_paths]
         else:
             # If no file paths provided, use placeholder
             file_paths = ["unknown_source"] * len(input)
@@ -1090,7 +1430,7 @@ class LightRAG:
             # Generate contents dict of MD5 hash IDs and documents with paths
             # Include file path in ID generation to ensure different files get different IDs
             contents = {
-                compute_mdhash_id(f"{content}\n{path}", prefix="doc-"): {
+                compute_mdhash_id(f"{content}\0{path}", prefix="doc-"): {
                     "content": content,
                     "file_path": path,
                 }
@@ -1119,17 +1459,50 @@ class LightRAG:
         # Exclude IDs of documents that are already enqueued
         unique_new_doc_ids = await self.doc_status.filter_keys(all_new_doc_ids)
 
-        # Log ignored document IDs (documents that were filtered out because they already exist)
+        # Handle duplicate documents - create trackable records with current track_id
         ignored_ids = list(all_new_doc_ids - unique_new_doc_ids)
         if ignored_ids:
+            duplicate_docs: dict[str, Any] = {}
             for doc_id in ignored_ids:
-                file_path = new_docs.get(doc_id, {}).get("file_path", "unknown_source")
-                logger.warning(
-                    f"Ignoring document ID (already exists): {doc_id} ({file_path})"
+                file_path = (
+                    new_docs.get(doc_id, {}).get("file_path") or "unknown_source"
                 )
-            if len(ignored_ids) > 3:
-                logger.warning(
-                    f"Total Ignoring {len(ignored_ids)} document IDs that already exist in storage"
+                logger.warning(f"Duplicate document detected: {doc_id} ({file_path})")
+
+                # Get existing document info for reference
+                existing_doc = await self.doc_status.get_by_id(doc_id)
+                existing_status = (
+                    existing_doc.get("status", "unknown") if existing_doc else "unknown"
+                )
+                existing_track_id = (
+                    existing_doc.get("track_id", "") if existing_doc else ""
+                )
+
+                # Create a new record with unique ID for this duplicate attempt
+                dup_record_id = compute_mdhash_id(f"{doc_id}-{track_id}", prefix="dup-")
+                duplicate_docs[dup_record_id] = {
+                    "status": DocStatus.FAILED,
+                    "content_summary": f"[DUPLICATE] Original document: {doc_id}",
+                    "content_length": new_docs.get(doc_id, {}).get("content_length", 0),
+                    "chunks_count": 0,
+                    "chunks_list": [],
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "file_path": file_path,
+                    "track_id": track_id,  # Use current track_id for tracking
+                    "error_msg": f"Content already exists. Original doc_id: {doc_id}, Status: {existing_status}",
+                    "metadata": {
+                        "is_duplicate": True,
+                        "original_doc_id": doc_id,
+                        "original_track_id": existing_track_id,
+                    },
+                }
+
+            # Store duplicate records in doc_status
+            if duplicate_docs:
+                await self.doc_status.upsert(duplicate_docs)
+                logger.info(
+                    f"Created {len(duplicate_docs)} duplicate document records with track_id: {track_id}"
                 )
 
         # Filter new_docs to only include documents with unique IDs
@@ -1146,7 +1519,10 @@ class LightRAG:
         # 4. Store document content in full_docs and status in doc_status
         #    Store full document content separately
         full_docs_data = {
-            doc_id: {"content": contents[doc_id]["content"]}
+            doc_id: {
+                "content": contents[doc_id]["content"],
+                "file_path": contents[doc_id]["file_path"],
+            }
             for doc_id in new_docs.keys()
         }
         await self.full_docs.upsert(full_docs_data)
@@ -1212,6 +1588,7 @@ class LightRAG:
                 "content_length": file_size,
                 "error_msg": original_error,
                 "chunks_count": 0,  # No chunks for failed files
+                "chunks_list": [],
                 "created_at": current_time,
                 "updated_at": current_time,
                 "file_path": file_path,
@@ -1281,7 +1658,7 @@ class LightRAG:
             for doc_id in inconsistent_docs:
                 try:
                     status_doc = to_process_docs[doc_id]
-                    file_path = getattr(status_doc, "file_path", "unknown_source")
+                    file_path = _resolve_doc_file_path(status_doc=status_doc)
 
                     # Delete doc_status entry
                     await self.doc_status.delete([doc_id])
@@ -1327,14 +1704,23 @@ class LightRAG:
                     DocStatus.PROCESSING,
                     DocStatus.FAILED,
                 ]:
+                    preserved_chunks_list, preserved_chunks_count = (
+                        _chunk_fields_from_status_doc(status_doc)
+                    )
+                    resolved_file_path = _resolve_doc_file_path(
+                        status_doc=status_doc,
+                        content_data=content_data,
+                    )
                     # Prepare document for status reset to PENDING
                     docs_to_reset[doc_id] = {
                         "status": DocStatus.PENDING,
                         "content_summary": status_doc.content_summary,
                         "content_length": status_doc.content_length,
+                        "chunks_count": preserved_chunks_count,
+                        "chunks_list": preserved_chunks_list,
                         "created_at": status_doc.created_at,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "file_path": getattr(status_doc, "file_path", "unknown_source"),
+                        "file_path": resolved_file_path,
                         "track_id": getattr(status_doc, "track_id", ""),
                         # Clear any error messages and processing metadata
                         "error_msg": "",
@@ -1343,6 +1729,7 @@ class LightRAG:
 
                     # Update the status in to_process_docs as well
                     status_doc.status = DocStatus.PENDING
+                    status_doc.file_path = resolved_file_path
                     reset_count += 1
 
         # Update doc_status storage if there are documents to reset
@@ -1375,23 +1762,22 @@ class LightRAG:
         """
 
         # Get pipeline status shared data and lock
-        pipeline_status = await get_namespace_data("pipeline_status")
-        pipeline_status_lock = get_pipeline_status_lock()
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=self.workspace
+        )
+        pipeline_status_lock = get_namespace_lock(
+            "pipeline_status", workspace=self.workspace
+        )
 
         # Check if another process is already processing the queue
         async with pipeline_status_lock:
             # Ensure only one worker is processing documents
             if not pipeline_status.get("busy", False):
-                processing_docs, failed_docs, pending_docs = await asyncio.gather(
-                    self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
-                    self.doc_status.get_docs_by_status(DocStatus.FAILED),
-                    self.doc_status.get_docs_by_status(DocStatus.PENDING),
+                to_process_docs: dict[
+                    str, DocProcessingStatus
+                ] = await self.doc_status.get_docs_by_statuses(
+                    [DocStatus.PROCESSING, DocStatus.FAILED, DocStatus.PENDING]
                 )
-
-                to_process_docs: dict[str, DocProcessingStatus] = {}
-                to_process_docs.update(processing_docs)
-                to_process_docs.update(failed_docs)
-                to_process_docs.update(pending_docs)
 
                 if not to_process_docs:
                     logger.info("No documents to process")
@@ -1406,6 +1792,7 @@ class LightRAG:
                         "batchs": 0,  # Total number of files to be processed
                         "cur_batch": 0,  # Number of files already processed
                         "request_pending": False,  # Clear any previous request
+                        "cancellation_requested": False,  # Initialize cancellation flag
                         "latest_message": "",
                     }
                 )
@@ -1422,6 +1809,22 @@ class LightRAG:
         try:
             # Process documents until no more documents or requests
             while True:
+                # Check for cancellation request at the start of main loop
+                async with pipeline_status_lock:
+                    if pipeline_status.get("cancellation_requested", False):
+                        # Clear pending request
+                        pipeline_status["request_pending"] = False
+                        # Celar cancellation flag
+                        pipeline_status["cancellation_requested"] = False
+
+                        log_message = "Pipeline cancelled by user"
+                        logger.info(log_message)
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+
+                        # Exit directly, skipping request_pending check
+                        return
+
                 if not to_process_docs:
                     log_message = "All enqueued documents have been processed"
                     logger.info(log_message)
@@ -1484,18 +1887,86 @@ class LightRAG:
                     semaphore: asyncio.Semaphore,
                 ) -> None:
                     """Process single document"""
+                    # Initialize variables at the start to prevent UnboundLocalError in error handling
+                    file_path = _resolve_doc_file_path(status_doc=status_doc)
+                    current_file_number = 0
                     file_extraction_stage_ok = False
+                    processing_start_time = int(time.time())
+                    first_stage_tasks = []
+                    entity_relation_task = None
+                    chunks: dict[str, Any] = {}
+                    content_data: dict[str, Any] | None = None
+
+                    # Per-doc indexing token trackers. Captures the LLM and
+                    # embedding usage spent indexing this one document so the
+                    # cost can be attributed downstream.
+                    #
+                    # IMPORTANT: we wrap llm_model_func with a *closure*, not
+                    # functools.partial. extract_entities reads the func via
+                    # `global_config = asdict(self)`, and `asdict` deep-copies
+                    # non-dataclass values — which would clone the partial's
+                    # `keywords` dict (including the TokenTracker), sending the
+                    # actual usage updates into a clone instead of our tracker.
+                    # Closures are deepcopy-immortal in Python, so the
+                    # `doc_llm_tracker` reference inside the closure survives.
+                    #
+                    # CAVEAT: with max_parallel_insert > 1, multiple docs share
+                    # these mutable hooks — recorded per-doc usage is
+                    # approximate (totals are correct, per-doc attribution is
+                    # fuzzy). Set MAX_PARALLEL_INSERT=1 for exact accounting.
+                    doc_llm_tracker = TokenTracker()
+                    doc_embedding_tracker = TokenTracker()
+                    original_llm_model_func = self.llm_model_func
+
+                    async def _llm_with_tracker(*args, **kwargs):
+                        kwargs.setdefault("token_tracker", doc_llm_tracker)
+                        return await original_llm_model_func(*args, **kwargs)
+
+                    self.llm_model_func = _llm_with_tracker
+                    embedding_inner = getattr(
+                        self.embedding_func, "__wrapped__", self.embedding_func
+                    )
+                    embedding_inner.token_tracker = doc_embedding_tracker
+
+                    def _doc_token_usage_metadata() -> dict[str, Any]:
+                        return {
+                            "llm_token_usage": doc_llm_tracker.get_usage(),
+                            "embedding_token_usage": doc_embedding_tracker.get_usage(),
+                            "llm_model_name": self.llm_model_name,
+                            "embedding_model_name": getattr(
+                                embedding_inner, "model_name", None
+                            ),
+                        }
+
+                    def get_failed_chunk_snapshot() -> tuple[list[str], int]:
+                        if chunks:
+                            chunk_ids = list(chunks.keys())
+                            return chunk_ids, len(chunk_ids)
+                        return _chunk_fields_from_status_doc(status_doc)
+
                     async with semaphore:
                         nonlocal processed_count
-                        current_file_number = 0
                         # Initialize to prevent UnboundLocalError in error handling
                         first_stage_tasks = []
                         entity_relation_task = None
                         try:
-                            # Get file path from status document
-                            file_path = getattr(
-                                status_doc, "file_path", "unknown_source"
-                            )
+                            # Resolve file_path from full_docs before honoring a queued
+                            # cancellation so corrupted doc_status placeholders do not
+                            # get written back again during retry/cancel flows.
+                            content_data = await self.full_docs.get_by_id(doc_id)
+                            if content_data:
+                                file_path = _resolve_doc_file_path(
+                                    status_doc=status_doc,
+                                    content_data=content_data,
+                                )
+                                status_doc.file_path = file_path
+
+                            # Check for cancellation before starting document processing.
+                            # file_path is resolved before this check so queued documents
+                            # do not lose their source path on early cancellation.
+                            async with pipeline_status_lock:
+                                if pipeline_status.get("cancellation_requested", False):
+                                    raise PipelineCancelledException("User cancelled")
 
                             async with pipeline_status_lock:
                                 # Update processed file count and save current file number
@@ -1518,19 +1989,39 @@ class LightRAG:
                                     logger.info(
                                         f"Trimming pipeline history from {len(pipeline_status['history_messages'])} to 5000 messages"
                                     )
-                                    pipeline_status["history_messages"] = (
-                                        pipeline_status["history_messages"][-5000:]
-                                    )
+                                    # Trim in place so Manager.list-backed shared state
+                                    # remains appendable and visible across processes.
+                                    del pipeline_status["history_messages"][:-5000]
 
                             # Get document content from full_docs
-                            content_data = await self.full_docs.get_by_id(doc_id)
                             if not content_data:
                                 raise Exception(
                                     f"Document content not found in full_docs for doc_id: {doc_id}"
                                 )
                             content = content_data["content"]
 
-                            # Generate chunks from document
+                            # Call chunking function, supporting both sync and async implementations
+                            chunking_result = self.chunking_func(
+                                self.tokenizer,
+                                content,
+                                split_by_character,
+                                split_by_character_only,
+                                self.chunk_overlap_token_size,
+                                self.chunk_token_size,
+                            )
+
+                            # If result is awaitable, await to get actual result
+                            if inspect.isawaitable(chunking_result):
+                                chunking_result = await chunking_result
+
+                            # Validate return type
+                            if not isinstance(chunking_result, (list, tuple)):
+                                raise TypeError(
+                                    f"chunking_func must return a list or tuple of dicts, "
+                                    f"got {type(chunking_result)}"
+                                )
+
+                            # Build chunks dictionary
                             chunks: dict[str, Any] = {
                                 compute_mdhash_id(dp["content"], prefix="chunk-"): {
                                     **dp,
@@ -1538,14 +2029,7 @@ class LightRAG:
                                     "file_path": file_path,  # Add file path to each chunk
                                     "llm_cache_list": [],  # Initialize empty LLM cache list for each chunk
                                 }
-                                for dp in self.chunking_func(
-                                    self.tokenizer,
-                                    content,
-                                    split_by_character,
-                                    split_by_character_only,
-                                    self.chunk_overlap_token_size,
-                                    self.chunk_token_size,
-                                )
+                                for dp in chunking_result
                             }
 
                             if not chunks:
@@ -1554,16 +2038,10 @@ class LightRAG:
                             # Record processing start time
                             processing_start_time = int(time.time())
 
-                            # Create token trackers for this document
-                            doc_llm_token_tracker = TokenTracker()
-                            doc_embedding_token_tracker = TokenTracker()
-
-                            # Set embedding tracker on the original EmbeddingFunc instance
-                            # (embedding_func is wrapped by priority_limit_async_func_call,
-                            # so we access the original via __wrapped__)
-                            self.embedding_func.__wrapped__.token_tracker = (
-                                doc_embedding_token_tracker
-                            )
+                            # Check for cancellation before entity extraction
+                            async with pipeline_status_lock:
+                                if pipeline_status.get("cancellation_requested", False):
+                                    raise PipelineCancelledException("User cancelled")
 
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
@@ -1612,26 +2090,36 @@ class LightRAG:
                             # Stage 2: Process entity relation graph (after text_chunks are saved)
                             entity_relation_task = asyncio.create_task(
                                 self._process_extract_entities(
-                                    chunks,
-                                    pipeline_status,
-                                    pipeline_status_lock,
-                                    token_tracker=doc_llm_token_tracker,
+                                    chunks, pipeline_status, pipeline_status_lock
                                 )
                             )
-                            await entity_relation_task
+                            chunk_results = await entity_relation_task
                             file_extraction_stage_ok = True
 
                         except Exception as e:
-                            # Log error and update pipeline status
-                            logger.error(traceback.format_exc())
-                            error_msg = f"Failed to extract document {current_file_number}/{total_files}: {file_path}"
-                            logger.error(error_msg)
-                            async with pipeline_status_lock:
-                                pipeline_status["latest_message"] = error_msg
-                                pipeline_status["history_messages"].append(
-                                    traceback.format_exc()
-                                )
-                                pipeline_status["history_messages"].append(error_msg)
+                            # Check if this is a user cancellation
+                            if isinstance(e, PipelineCancelledException):
+                                # User cancellation - log brief message only, no traceback
+                                error_msg = f"User cancelled {current_file_number}/{total_files}: {file_path}"
+                                logger.warning(error_msg)
+                                async with pipeline_status_lock:
+                                    pipeline_status["latest_message"] = error_msg
+                                    pipeline_status["history_messages"].append(
+                                        error_msg
+                                    )
+                            else:
+                                # Other exceptions - log with traceback
+                                logger.error(traceback.format_exc())
+                                error_msg = f"Failed to extract document {current_file_number}/{total_files}: {file_path}"
+                                logger.error(error_msg)
+                                async with pipeline_status_lock:
+                                    pipeline_status["latest_message"] = error_msg
+                                    pipeline_status["history_messages"].append(
+                                        traceback.format_exc()
+                                    )
+                                    pipeline_status["history_messages"].append(
+                                        error_msg
+                                    )
 
                             # Cancel tasks that are not yet completed
                             all_tasks = first_stage_tasks + (
@@ -1641,15 +2129,20 @@ class LightRAG:
                                 if task and not task.done():
                                     task.cancel()
 
-                            # Clear embedding tracker from shared embedding func
-                            self.embedding_func.__wrapped__.token_tracker = None
-
-                            # Persistent llm cache
+                            # Persistent llm cache with error handling
                             if self.llm_response_cache:
-                                await self.llm_response_cache.index_done_callback()
+                                try:
+                                    await self.llm_response_cache.index_done_callback()
+                                except Exception as persist_error:
+                                    logger.error(
+                                        f"Failed to persist LLM cache: {persist_error}"
+                                    )
 
                             # Record processing end time for failed case
                             processing_end_time = int(time.time())
+                            failed_chunks_list, failed_chunks_count = (
+                                get_failed_chunk_snapshot()
+                            )
 
                             # Update document status to failed
                             await self.doc_status.upsert(
@@ -1657,6 +2150,8 @@ class LightRAG:
                                     doc_id: {
                                         "status": DocStatus.FAILED,
                                         "error_msg": str(e),
+                                        "chunks_count": failed_chunks_count,
+                                        "chunks_list": failed_chunks_list,
                                         "content_summary": status_doc.content_summary,
                                         "content_length": status_doc.content_length,
                                         "created_at": status_doc.created_at,
@@ -1668,6 +2163,7 @@ class LightRAG:
                                         "metadata": {
                                             "processing_start_time": processing_start_time,
                                             "processing_end_time": processing_end_time,
+                                            **_doc_token_usage_metadata(),
                                         },
                                     }
                                 }
@@ -1676,8 +2172,16 @@ class LightRAG:
                         # Concurrency is controlled by keyed lock for individual entities and relationships
                         if file_extraction_stage_ok:
                             try:
-                                # Get chunk_results from entity_relation_task
-                                chunk_results = await entity_relation_task
+                                # Check for cancellation before merge
+                                async with pipeline_status_lock:
+                                    if pipeline_status.get(
+                                        "cancellation_requested", False
+                                    ):
+                                        raise PipelineCancelledException(
+                                            "User cancelled"
+                                        )
+
+                                # Use chunk_results from entity_relation_task
                                 await merge_nodes_and_edges(
                                     chunk_results=chunk_results,  # result collected from entity_relation_task
                                     knowledge_graph_inst=self.chunk_entity_relation_graph,
@@ -1690,23 +2194,15 @@ class LightRAG:
                                     pipeline_status=pipeline_status,
                                     pipeline_status_lock=pipeline_status_lock,
                                     llm_response_cache=self.llm_response_cache,
+                                    entity_chunks_storage=self.entity_chunks,
+                                    relation_chunks_storage=self.relation_chunks,
                                     current_file_number=current_file_number,
                                     total_files=total_files,
                                     file_path=file_path,
-                                    token_tracker=doc_llm_token_tracker,
                                 )
 
                                 # Record processing end time
                                 processing_end_time = int(time.time())
-
-                                # Clear embedding tracker from shared embedding func
-                                self.embedding_func.__wrapped__.token_tracker = None
-
-                                # Collect token usage from document processing
-                                llm_token_usage = doc_llm_token_tracker.get_usage()
-                                embedding_token_usage = (
-                                    doc_embedding_token_tracker.get_usage()
-                                )
 
                                 await self.doc_status.upsert(
                                     {
@@ -1725,16 +2221,7 @@ class LightRAG:
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
-                                                "llm_token_usage": llm_token_usage,
-                                                "embedding_token_usage": embedding_token_usage,
-                                                "llm_model_name": os.environ.get(
-                                                    "AZURE_OPENAI_DEPLOYMENT"
-                                                )
-                                                or self.llm_model_name,
-                                                "embedding_model_name": os.environ.get(
-                                                    "AZURE_EMBEDDING_DEPLOYMENT"
-                                                )
-                                                or os.environ.get("EMBEDDING_MODEL"),
+                                                **_doc_token_usage_metadata(),
                                             },
                                         }
                                     }
@@ -1752,25 +2239,44 @@ class LightRAG:
                                     )
 
                             except Exception as e:
-                                # Log error and update pipeline status
-                                logger.error(traceback.format_exc())
-                                error_msg = f"Merging stage failed in document {current_file_number}/{total_files}: {file_path}"
-                                logger.error(error_msg)
-                                async with pipeline_status_lock:
-                                    pipeline_status["latest_message"] = error_msg
-                                    pipeline_status["history_messages"].append(
-                                        traceback.format_exc()
-                                    )
-                                    pipeline_status["history_messages"].append(
-                                        error_msg
-                                    )
+                                # Check if this is a user cancellation
+                                if isinstance(e, PipelineCancelledException):
+                                    # User cancellation - log brief message only, no traceback
+                                    error_msg = f"User cancelled during merge {current_file_number}/{total_files}: {file_path}"
+                                    logger.warning(error_msg)
+                                    async with pipeline_status_lock:
+                                        pipeline_status["latest_message"] = error_msg
+                                        pipeline_status["history_messages"].append(
+                                            error_msg
+                                        )
+                                else:
+                                    # Other exceptions - log with traceback
+                                    logger.error(traceback.format_exc())
+                                    error_msg = f"Merging stage failed in document {current_file_number}/{total_files}: {file_path}"
+                                    logger.error(error_msg)
+                                    async with pipeline_status_lock:
+                                        pipeline_status["latest_message"] = error_msg
+                                        pipeline_status["history_messages"].append(
+                                            traceback.format_exc()
+                                        )
+                                        pipeline_status["history_messages"].append(
+                                            error_msg
+                                        )
 
-                                # Persistent llm cache
+                                # Persistent llm cache with error handling
                                 if self.llm_response_cache:
-                                    await self.llm_response_cache.index_done_callback()
+                                    try:
+                                        await self.llm_response_cache.index_done_callback()
+                                    except Exception as persist_error:
+                                        logger.error(
+                                            f"Failed to persist LLM cache: {persist_error}"
+                                        )
 
                                 # Record processing end time for failed case
                                 processing_end_time = int(time.time())
+                                failed_chunks_list, failed_chunks_count = (
+                                    get_failed_chunk_snapshot()
+                                )
 
                                 # Update document status to failed
                                 await self.doc_status.upsert(
@@ -1778,19 +2284,33 @@ class LightRAG:
                                         doc_id: {
                                             "status": DocStatus.FAILED,
                                             "error_msg": str(e),
+                                            "chunks_count": failed_chunks_count,
+                                            "chunks_list": failed_chunks_list,
                                             "content_summary": status_doc.content_summary,
                                             "content_length": status_doc.content_length,
                                             "created_at": status_doc.created_at,
-                                            "updated_at": datetime.now().isoformat(),
+                                            "updated_at": datetime.now(
+                                                timezone.utc
+                                            ).isoformat(),
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
+                                                **_doc_token_usage_metadata(),
                                             },
                                         }
                                     }
                                 )
+
+                    # Restore the original llm_model_func and clear the embedding
+                    # tracker now that this document is done. Done at the end of
+                    # process_document so the trackers don't leak across docs.
+                    # (The inner try/except blocks handle all expected failures,
+                    # so this point is reached on both success and handled
+                    # failure paths.)
+                    self.llm_model_func = original_llm_model_func
+                    embedding_inner.token_tracker = None
 
                 # Create processing tasks for all documents
                 doc_tasks = []
@@ -1808,7 +2328,19 @@ class LightRAG:
                     )
 
                 # Wait for all document processing to complete
-                await asyncio.gather(*doc_tasks)
+                try:
+                    await asyncio.gather(*doc_tasks)
+                except PipelineCancelledException:
+                    # Cancel all remaining tasks
+                    for task in doc_tasks:
+                        if not task.done():
+                            task.cancel()
+
+                    # Wait for all tasks to complete cancellation
+                    await asyncio.wait(doc_tasks, return_when=asyncio.ALL_COMPLETED)
+
+                    # Exit directly (document statuses already updated in process_document)
+                    return
 
                 # Check if there's a pending request to process more documents (with lock)
                 has_pending_request = False
@@ -1827,32 +2359,24 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
                 # Check for pending documents again
-                processing_docs, failed_docs, pending_docs = await asyncio.gather(
-                    self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
-                    self.doc_status.get_docs_by_status(DocStatus.FAILED),
-                    self.doc_status.get_docs_by_status(DocStatus.PENDING),
+                to_process_docs = await self.doc_status.get_docs_by_statuses(
+                    [DocStatus.PROCESSING, DocStatus.FAILED, DocStatus.PENDING]
                 )
 
-                to_process_docs = {}
-                to_process_docs.update(processing_docs)
-                to_process_docs.update(failed_docs)
-                to_process_docs.update(pending_docs)
-
         finally:
-            log_message = "Enqueued document processing pipeline stoped"
+            log_message = "Enqueued document processing pipeline stopped"
             logger.info(log_message)
-            # Always reset busy status when done or if an exception occurs (with lock)
+            # Always reset busy status and cancellation flag when done or if an exception occurs (with lock)
             async with pipeline_status_lock:
                 pipeline_status["busy"] = False
+                pipeline_status["cancellation_requested"] = (
+                    False  # Always reset cancellation flag
+                )
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
 
     async def _process_extract_entities(
-        self,
-        chunk: dict[str, Any],
-        pipeline_status=None,
-        pipeline_status_lock=None,
-        token_tracker=None,
+        self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
     ) -> list:
         try:
             chunk_results = await extract_entities(
@@ -1862,7 +2386,6 @@ class LightRAG:
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.llm_response_cache,
                 text_chunks_storage=self.text_chunks,
-                token_tracker=token_tracker,
             )
             return chunk_results
         except Exception as e:
@@ -1884,6 +2407,8 @@ class LightRAG:
                 self.text_chunks,
                 self.full_entities,
                 self.full_relations,
+                self.entity_chunks,
+                self.relation_chunks,
                 self.llm_response_cache,
                 self.entities_vdb,
                 self.relationships_vdb,
@@ -1951,9 +2476,18 @@ class LightRAG:
                     self.text_chunks.upsert(all_chunks_data),
                 )
 
-            # Insert entities into knowledge graph
-            all_entities_data: list[dict[str, str]] = []
+            # Keep the last declaration for each entity_name so batch backends
+            # preserve the old serial upsert semantics deterministically.
+            deduped_entities: dict[str, dict[str, Any]] = {}
             for entity_data in custom_kg.get("entities", []):
+                entity_name = entity_data["entity_name"]
+                deduped_entities.pop(entity_name, None)
+                deduped_entities[entity_name] = entity_data
+
+            # Insert entities into knowledge graph (batch for performance)
+            all_entities_data: list[dict[str, str]] = []
+            entity_nodes: list[tuple[str, dict[str, str]]] = []
+            for entity_data in deduped_entities.values():
                 entity_name = entity_data["entity_name"]
                 entity_type = entity_data.get("entity_type", "UNKNOWN")
                 description = entity_data.get("description", "No description provided")
@@ -1961,13 +2495,11 @@ class LightRAG:
                 source_id = chunk_to_source_map.get(source_chunk_id, "UNKNOWN")
                 file_path = entity_data.get("file_path", "custom_kg")
 
-                # Log if source_id is UNKNOWN
                 if source_id == "UNKNOWN":
                     logger.warning(
                         f"Entity '{entity_name}' has an UNKNOWN source_id. Please check the source mapping."
                     )
 
-                # Prepare node data
                 node_data: dict[str, str] = {
                     "entity_id": entity_name,
                     "entity_type": entity_type,
@@ -1976,78 +2508,107 @@ class LightRAG:
                     "file_path": file_path,
                     "created_at": int(time.time()),
                 }
-                # Insert node data into the knowledge graph
-                await self.chunk_entity_relation_graph.upsert_node(
-                    entity_name, node_data=node_data
-                )
-                node_data["entity_name"] = entity_name
-                all_entities_data.append(node_data)
+                entity_nodes.append((entity_name, node_data))
+                node_data_copy = dict(node_data)
+                node_data_copy["entity_name"] = entity_name
+                all_entities_data.append(node_data_copy)
                 update_storage = True
 
-            # Insert relationships into knowledge graph
-            all_relationships_data: list[dict[str, str]] = []
+            # Batch insert entities (reduces N serial awaits to 1)
+            if entity_nodes:
+                await self.chunk_entity_relation_graph.upsert_nodes_batch(entity_nodes)
+
+            # Relationship storage is undirected, so keep only the last update
+            # for each endpoint pair regardless of order.
+            deduped_relationships: dict[tuple[str, str], dict[str, Any]] = {}
             for relationship_data in custom_kg.get("relationships", []):
                 src_id = relationship_data["src_id"]
                 tgt_id = relationship_data["tgt_id"]
-                description = relationship_data["description"]
-                keywords = relationship_data["keywords"]
-                weight = relationship_data.get("weight", 1.0)
+                relation_key = tuple(sorted((src_id, tgt_id)))
+                deduped_relationships.pop(relation_key, None)
+                deduped_relationships[relation_key] = relationship_data
+
+            # Insert relationships into knowledge graph (batch for performance)
+            all_relationships_data: list[dict[str, str]] = []
+            edge_list: list[tuple[str, str, dict[str, str]]] = []
+
+            # Batch check which relationship endpoints exist (1 await instead of 2M)
+            needed_node_ids: set[str] = set()
+            for relationship_data in deduped_relationships.values():
+                needed_node_ids.add(relationship_data["src_id"])
+                needed_node_ids.add(relationship_data["tgt_id"])
+
+            existing_nodes = await self.chunk_entity_relation_graph.has_nodes_batch(
+                list(needed_node_ids)
+            )
+
+            # Create missing nodes in batch
+            missing_nodes: list[tuple[str, dict[str, str]]] = []
+            for relationship_data in deduped_relationships.values():
+                src_id = relationship_data["src_id"]
+                tgt_id = relationship_data["tgt_id"]
                 source_chunk_id = relationship_data.get("source_id", "UNKNOWN")
                 source_id = chunk_to_source_map.get(source_chunk_id, "UNKNOWN")
                 file_path = relationship_data.get("file_path", "custom_kg")
 
-                # Log if source_id is UNKNOWN
                 if source_id == "UNKNOWN":
                     logger.warning(
                         f"Relationship from '{src_id}' to '{tgt_id}' has an UNKNOWN source_id. Please check the source mapping."
                     )
 
-                # Check if nodes exist in the knowledge graph
                 for need_insert_id in [src_id, tgt_id]:
-                    if not (
-                        await self.chunk_entity_relation_graph.has_node(need_insert_id)
-                    ):
-                        await self.chunk_entity_relation_graph.upsert_node(
-                            need_insert_id,
-                            node_data={
-                                "entity_id": need_insert_id,
-                                "source_id": source_id,
-                                "description": "UNKNOWN",
-                                "entity_type": "UNKNOWN",
-                                "file_path": file_path,
-                                "created_at": int(time.time()),
-                            },
+                    if need_insert_id not in existing_nodes:
+                        missing_nodes.append(
+                            (
+                                need_insert_id,
+                                {
+                                    "entity_id": need_insert_id,
+                                    "source_id": source_id,
+                                    "description": "UNKNOWN",
+                                    "entity_type": "UNKNOWN",
+                                    "file_path": file_path,
+                                    "created_at": int(time.time()),
+                                },
+                            )
                         )
+                        existing_nodes.add(need_insert_id)
 
-                # Insert edge into the knowledge graph
-                await self.chunk_entity_relation_graph.upsert_edge(
-                    src_id,
-                    tgt_id,
-                    edge_data={
-                        "weight": weight,
-                        "description": description,
-                        "keywords": keywords,
-                        "source_id": source_id,
-                        "file_path": file_path,
-                        "created_at": int(time.time()),
-                    },
-                )
+                normalized_src_id, normalized_tgt_id = sorted((src_id, tgt_id))
 
-                edge_data: dict[str, str] = {
-                    "src_id": src_id,
-                    "tgt_id": tgt_id,
-                    "description": description,
-                    "keywords": keywords,
+                edge_data = {
+                    "weight": relationship_data.get("weight", 1.0),
+                    "description": relationship_data["description"],
+                    "keywords": relationship_data["keywords"],
                     "source_id": source_id,
-                    "weight": weight,
                     "file_path": file_path,
                     "created_at": int(time.time()),
                 }
-                all_relationships_data.append(edge_data)
+                edge_list.append((src_id, tgt_id, edge_data))
+
+                all_relationships_data.append(
+                    {
+                        "src_id": normalized_src_id,
+                        "tgt_id": normalized_tgt_id,
+                        "description": relationship_data["description"],
+                        "keywords": relationship_data["keywords"],
+                        "source_id": source_id,
+                        "weight": relationship_data.get("weight", 1.0),
+                        "file_path": file_path,
+                        "created_at": int(time.time()),
+                    }
+                )
                 update_storage = True
 
-            # Insert entities into vector storage with consistent format
-            data_for_vdb = {
+            # Batch insert missing placeholder nodes
+            if missing_nodes:
+                await self.chunk_entity_relation_graph.upsert_nodes_batch(missing_nodes)
+
+            # Batch insert edges
+            if edge_list:
+                await self.chunk_entity_relation_graph.upsert_edges_batch(edge_list)
+
+            # Insert entities and relationships into vector storage (parallel)
+            data_for_entities_vdb = {
                 compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
                     "content": dp["entity_name"] + "\n" + dp["description"],
                     "entity_name": dp["entity_name"],
@@ -2058,10 +2619,8 @@ class LightRAG:
                 }
                 for dp in all_entities_data
             }
-            await self.entities_vdb.upsert(data_for_vdb)
 
-            # Insert relationships into vector storage with consistent format
-            data_for_vdb = {
+            data_for_rels_vdb = {
                 compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
                     "src_id": dp["src_id"],
                     "tgt_id": dp["tgt_id"],
@@ -2074,7 +2633,23 @@ class LightRAG:
                 }
                 for dp in all_relationships_data
             }
-            await self.relationships_vdb.upsert(data_for_vdb)
+
+            legacy_rel_ids_to_delete = sorted(
+                {
+                    rel_id
+                    for dp in all_relationships_data
+                    for rel_id in make_relation_vdb_ids(dp["src_id"], dp["tgt_id"])[1:]
+                }
+            )
+
+            # Parallel VDB upserts (was serial in original)
+            await asyncio.gather(
+                self.entities_vdb.upsert(data_for_entities_vdb),
+                self.relationships_vdb.upsert(data_for_rels_vdb),
+            )
+
+            if legacy_rel_ids_to_delete:
+                await self.relationships_vdb.delete(legacy_rel_ids_to_delete)
 
         except Exception as e:
             logger.error(f"Error in ainsert_custom_kg: {e}")
@@ -2311,16 +2886,14 @@ class LightRAG:
             )
         elif data_param.mode == "naive":
             logger.debug(f"[aquery_data] Using naive_query for mode: {data_param.mode}")
-            raw_data = await naive_query(
+            query_result = await naive_query(
                 query.strip(),
                 self.chunks_vdb,
                 data_param,  # Use data_param with only_need_context=True
                 global_config,
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
-                return_raw_data=True,
             )
-            query_result = QueryResult(content="", raw_data=raw_data)
         elif data_param.mode == "bypass":
             logger.debug("[aquery_data] Using bypass mode")
             # bypass mode returns empty data using convert_to_user_format
@@ -2335,20 +2908,35 @@ class LightRAG:
         else:
             raise ValueError(f"Unknown mode {data_param.mode}")
 
-        # Extract raw_data from QueryResult
-        final_data = query_result.raw_data if query_result else {}
-
-        # Log final result counts - adapt to new data format from convert_to_user_format
-        if final_data and "data" in final_data:
-            data_section = final_data["data"]
-            entities_count = len(data_section.get("entities", []))
-            relationships_count = len(data_section.get("relationships", []))
-            chunks_count = len(data_section.get("chunks", []))
-            logger.debug(
-                f"[aquery_data] Final result: {entities_count} entities, {relationships_count} relationships, {chunks_count} chunks"
-            )
+        if query_result is None:
+            no_result_message = "Query returned no results"
+            if data_param.mode == "naive":
+                no_result_message = "No relevant document chunks found."
+            final_data: dict[str, Any] = {
+                "status": "failure",
+                "message": no_result_message,
+                "data": {},
+                "metadata": {
+                    "failure_reason": "no_results",
+                    "mode": data_param.mode,
+                },
+            }
+            logger.info("[aquery_data] Query returned no results.")
         else:
-            logger.warning("[aquery_data] No data section found in query result")
+            # Extract raw_data from QueryResult
+            final_data = query_result.raw_data or {}
+
+            # Log final result counts - adapt to new data format from convert_to_user_format
+            if final_data and "data" in final_data:
+                data_section = final_data["data"]
+                entities_count = len(data_section.get("entities", []))
+                relationships_count = len(data_section.get("relationships", []))
+                chunks_count = len(data_section.get("chunks", []))
+                logger.debug(
+                    f"[aquery_data] Final result: {entities_count} entities, {relationships_count} relationships, {chunks_count} chunks"
+                )
+            else:
+                logger.warning("[aquery_data] No data section found in query result")
 
         await self._query_done()
         return final_data
@@ -2377,9 +2965,31 @@ class LightRAG:
 
         global_config = asdict(self)
 
-        # Track embedding token usage during query
-        query_embedding_token_tracker = TokenTracker()
-        self.embedding_func.__wrapped__.token_tracker = query_embedding_token_tracker
+        # Per-request token trackers. The LLM tracker is injected by wrapping
+        # llm_model_func via partial — any call through the wrapped func gets
+        # token_tracker=... passed to the provider, which records usage. The
+        # embedding tracker attaches to the live EmbeddingFunc wrapper for the
+        # duration of the query and is reset in `finally`.
+        llm_tracker = TokenTracker()
+        embedding_tracker = TokenTracker()
+
+        original_llm_func = global_config["llm_model_func"]
+        global_config["llm_model_func"] = partial(
+            original_llm_func, token_tracker=llm_tracker
+        )
+        if param.model_func is not None:
+            param = replace(param, model_func=partial(param.model_func, token_tracker=llm_tracker))
+
+        embedding_inner = getattr(self.embedding_func, "__wrapped__", self.embedding_func)
+        embedding_inner.token_tracker = embedding_tracker
+
+        def _build_token_usage_block() -> dict[str, Any]:
+            return {
+                "token_usage": llm_tracker.get_usage(),
+                "embedding_token_usage": embedding_tracker.get_usage(),
+                "model_name": self.llm_model_name,
+                "embedding_model_name": getattr(embedding_inner, "model_name", None),
+            }
 
         try:
             query_result = None
@@ -2431,6 +3041,7 @@ class LightRAG:
                             "response_iterator": None,
                             "is_streaming": False,
                         },
+                        **_build_token_usage_block(),
                     }
                 else:
                     return {
@@ -2443,6 +3054,7 @@ class LightRAG:
                             "response_iterator": response,
                             "is_streaming": True,
                         },
+                        **_build_token_usage_block(),
                     }
             else:
                 raise ValueError(f"Unknown mode {param.mode}")
@@ -2455,16 +3067,20 @@ class LightRAG:
                     "status": "failure",
                     "message": "Query returned no results",
                     "data": {},
-                    "metadata": {},
+                    "metadata": {
+                        "failure_reason": "no_results",
+                        "mode": param.mode,
+                    },
                     "llm_response": {
-                        "content": None,
+                        "content": PROMPTS["fail_response"],
                         "response_iterator": None,
                         "is_streaming": False,
                     },
+                    **_build_token_usage_block(),
                 }
 
             # Extract structured data from query result
-            raw_data = query_result.raw_data if query_result else {}
+            raw_data = query_result.raw_data or {}
             raw_data["llm_response"] = {
                 "content": query_result.content
                 if not query_result.is_streaming
@@ -2474,21 +3090,7 @@ class LightRAG:
                 else None,
                 "is_streaming": query_result.is_streaming,
             }
-
-            # Clear embedding tracker
-            self.embedding_func.__wrapped__.token_tracker = None
-
-            # Attach token usage and model info for cost tracking
-            raw_data["token_usage"] = query_result.token_usage or {}
-            raw_data["embedding_token_usage"] = (
-                query_embedding_token_tracker.get_usage()
-            )
-            raw_data["model_name"] = (
-                os.environ.get("AZURE_OPENAI_DEPLOYMENT") or self.llm_model_name
-            )
-            raw_data["embedding_model_name"] = os.environ.get(
-                "AZURE_EMBEDDING_DEPLOYMENT"
-            ) or os.environ.get("EMBEDDING_MODEL")
+            raw_data.update(_build_token_usage_block())
 
             return raw_data
 
@@ -2505,7 +3107,12 @@ class LightRAG:
                     "response_iterator": None,
                     "is_streaming": False,
                 },
+                **_build_token_usage_block(),
             }
+        finally:
+            # Detach the embedding tracker so future requests don't accidentally
+            # share usage state through the shared EmbeddingFunc wrapper.
+            embedding_inner.token_tracker = None
 
     def query_llm(
         self,
@@ -2532,6 +3139,77 @@ class LightRAG:
 
     async def _query_done(self):
         await self.llm_response_cache.index_done_callback()
+
+    async def _update_delete_retry_state(
+        self,
+        doc_id: str,
+        doc_status_data: dict[str, Any],
+        *,
+        deletion_stage: str,
+        doc_llm_cache_ids: list[str],
+        error_message: str | None = None,
+        failed: bool,
+    ) -> dict[str, Any]:
+        """Persist deletion retry metadata and return the updated status record."""
+        metadata = doc_status_data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        backup_cache_ids = _normalize_string_list(
+            metadata.get("deletion_llm_cache_ids", []),
+            context=f"doc {doc_id} metadata.deletion_llm_cache_ids",
+        )
+        retry_cache_ids = doc_llm_cache_ids or backup_cache_ids
+
+        updated_metadata = dict(metadata)
+        if retry_cache_ids:
+            updated_metadata["deletion_llm_cache_ids"] = retry_cache_ids
+        updated_metadata["last_deletion_attempt_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        if failed:
+            updated_metadata["deletion_failed"] = True
+            updated_metadata["deletion_failure_stage"] = deletion_stage
+        else:
+            updated_metadata.pop("deletion_failed", None)
+            updated_metadata.pop("deletion_failure_stage", None)
+
+        updated_status_data = {
+            **doc_status_data,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": updated_metadata,
+            "error_msg": error_message if failed else "",
+        }
+
+        await self.doc_status.upsert({doc_id: updated_status_data})
+        return updated_status_data
+
+    async def _get_existing_llm_cache_ids(self, cache_ids: list[str]) -> list[str]:
+        """Return cache IDs that still exist in cache storage.
+
+        Some KV storage backends only log delete failures and return without
+        raising, so callers must verify which records still exist after delete.
+
+        Returns an empty list immediately if cache storage is unavailable.
+        Callers must check storage availability independently before treating
+        an empty result as a confirmed deletion.
+        """
+        if not self.llm_response_cache or not cache_ids:
+            return []
+
+        try:
+            existing_records = await self.llm_response_cache.get_by_ids(cache_ids)
+        except Exception as verification_error:
+            raise Exception(
+                f"Failed to verify LLM cache deletion "
+                f"(delete may have succeeded): {verification_error}"
+            ) from verification_error
+        return [
+            cache_id
+            for cache_id, record in zip(cache_ids, existing_records)
+            if record is not None
+        ]
 
     async def aclear_cache(self) -> None:
         """Clear all cache data from the LLM response cache storage.
@@ -2637,30 +3315,103 @@ class LightRAG:
         # Return the dictionary containing statuses only for the found document IDs
         return found_statuses
 
-    async def adelete_by_doc_id(self, doc_id: str) -> DeletionResult:
-        """Delete a document and all its related data, including chunks, graph elements, and cached entries.
+    async def adelete_by_doc_id(
+        self, doc_id: str, delete_llm_cache: bool = False
+    ) -> DeletionResult:
+        """Delete a document and all its related data, including chunks, graph elements.
 
         This method orchestrates a comprehensive deletion process for a given document ID.
         It ensures that not only the document itself but also all its derived and associated
-        data across different storage layers are removed. If entities or relationships are partially affected, it triggers.
+        data across different storage layers are removed or rebuiled. If entities or relationships
+        are partially affected, they will be rebuilded using LLM cached from remaining documents.
+
+        **Concurrency Control Design:**
+
+        This function implements a pipeline-based concurrency control to prevent data corruption:
+
+        1. **Single Document Deletion** (when WE acquire pipeline):
+           - Sets job_name to "Single document deletion" (NOT starting with "deleting")
+           - Prevents other adelete_by_doc_id calls from running concurrently
+           - Ensures exclusive access to graph operations for this deletion
+
+        2. **Batch Document Deletion** (when background_delete_documents acquires pipeline):
+           - Sets job_name to "Deleting {N} Documents" (starts with "deleting")
+           - Allows multiple adelete_by_doc_id calls to join the deletion queue
+           - Each call validates the job name to ensure it's part of a deletion operation
+
+        The validation logic `if not job_name.startswith("deleting") or "document" not in job_name`
+        ensures that:
+        - adelete_by_doc_id can only run when pipeline is idle OR during batch deletion
+        - Prevents concurrent single deletions that could cause race conditions
+        - Rejects operations when pipeline is busy with non-deletion tasks
 
         Args:
             doc_id (str): The unique identifier of the document to be deleted.
+            delete_llm_cache (bool): Whether to delete cached LLM extraction results
+                associated with the document. Defaults to False.
 
         Returns:
             DeletionResult: An object containing the outcome of the deletion process.
-                - `status` (str): "success", "not_found", or "failure".
+                - `status` (str): "success", "not_found", "not_allowed", or "fail".
                 - `doc_id` (str): The ID of the document attempted to be deleted.
                 - `message` (str): A summary of the operation's result.
-                - `status_code` (int): HTTP status code (e.g., 200, 404, 500).
+                - `status_code` (int): HTTP status code (e.g., 200, 404, 403, 500).
                 - `file_path` (str | None): The file path of the deleted document, if available.
         """
-        deletion_operations_started = False
-        original_exception = None
+        # Get pipeline status shared data and lock for validation
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=self.workspace
+        )
+        pipeline_status_lock = get_namespace_lock(
+            "pipeline_status", workspace=self.workspace
+        )
 
-        # Get pipeline status shared data and lock for status updates
-        pipeline_status = await get_namespace_data("pipeline_status")
-        pipeline_status_lock = get_pipeline_status_lock()
+        # Track whether WE acquired the pipeline
+        we_acquired_pipeline = False
+
+        # Check and acquire pipeline if needed
+        async with pipeline_status_lock:
+            if not pipeline_status.get("busy", False):
+                # Pipeline is idle - WE acquire it for this deletion
+                we_acquired_pipeline = True
+                pipeline_status.update(
+                    {
+                        "busy": True,
+                        "job_name": "Single document deletion",
+                        "job_start": datetime.now(timezone.utc).isoformat(),
+                        "docs": 1,
+                        "batchs": 1,
+                        "cur_batch": 0,
+                        "request_pending": False,
+                        "cancellation_requested": False,
+                        "latest_message": f"Starting deletion for document: {doc_id}",
+                    }
+                )
+                # Initialize history messages
+                pipeline_status["history_messages"][:] = [
+                    f"Starting deletion for document: {doc_id}"
+                ]
+            else:
+                # Pipeline already busy - verify it's a deletion job
+                job_name = pipeline_status.get("job_name", "").lower()
+                if not job_name.startswith("deleting") or "document" not in job_name:
+                    return DeletionResult(
+                        status="not_allowed",
+                        doc_id=doc_id,
+                        message=f"Deletion not allowed: current job '{pipeline_status.get('job_name')}' is not a document deletion job",
+                        status_code=403,
+                        file_path=None,
+                    )
+                # Pipeline is busy with deletion - proceed without acquiring
+
+        deletion_operations_started = False
+        deletion_fully_completed = False
+        in_final_delete_stage = False
+        original_exception = None
+        doc_llm_cache_ids: list[str] = []
+        deletion_stage = "initializing"
+        doc_status_data: dict[str, Any] | None = None
+        file_path: str | None = None
 
         async with pipeline_status_lock:
             log_message = f"Starting deletion process for document {doc_id}"
@@ -2683,7 +3434,12 @@ class LightRAG:
                 )
 
             # Check document status and log warning for non-completed documents
-            doc_status = doc_status_data.get("status")
+            raw_status = doc_status_data.get("status")
+            try:
+                doc_status = DocStatus(raw_status)
+            except ValueError:
+                doc_status = raw_status
+
             if doc_status != DocStatus.PROCESSED:
                 if doc_status == DocStatus.PENDING:
                     warning_msg = (
@@ -2693,12 +3449,23 @@ class LightRAG:
                     warning_msg = (
                         f"Deleting {doc_id} {file_path}(previous status: PROCESSING)"
                     )
+                elif doc_status == DocStatus.PREPROCESSED:
+                    warning_msg = (
+                        f"Deleting {doc_id} {file_path}(previous status: PREPROCESSED)"
+                    )
                 elif doc_status == DocStatus.FAILED:
                     warning_msg = (
                         f"Deleting {doc_id} {file_path}(previous status: FAILED)"
                     )
                 else:
-                    warning_msg = f"Deleting {doc_id} {file_path}(previous status: {doc_status.value})"
+                    status_text = (
+                        doc_status.value
+                        if isinstance(doc_status, DocStatus)
+                        else str(doc_status)
+                    )
+                    warning_msg = (
+                        f"Deleting {doc_id} {file_path}(previous status: {status_text})"
+                    )
                 logger.info(warning_msg)
                 # Update pipeline status for monitoring
                 async with pipeline_status_lock:
@@ -2706,16 +3473,67 @@ class LightRAG:
                     pipeline_status["history_messages"].append(warning_msg)
 
             # 2. Get chunk IDs from document status
-            chunk_ids = set(doc_status_data.get("chunks_list", []))
+            metadata = doc_status_data.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata_cache_ids = _normalize_string_list(
+                metadata.get("deletion_llm_cache_ids", []),
+                context=f"doc {doc_id} metadata.deletion_llm_cache_ids",
+            )
+            chunk_ids = set(
+                _normalize_string_list(
+                    doc_status_data.get("chunks_list", []),
+                    context=f"doc {doc_id} chunks_list",
+                )
+            )
 
             if not chunk_ids:
                 logger.warning(f"No chunks found for document {doc_id}")
                 # Mark that deletion operations have started
                 deletion_operations_started = True
+
+                # A prior failed deletion may have collected LLM cache IDs before the
+                # chunks were removed. If delete_llm_cache is requested and persisted IDs
+                # exist, clean them up now before removing the doc/status entries.
+                if delete_llm_cache and metadata_cache_ids:
+                    if not self.llm_response_cache:
+                        no_cache_msg = (
+                            f"Cannot delete LLM cache for document {doc_id}: "
+                            "cache storage is unavailable"
+                        )
+                        logger.error(no_cache_msg)
+                        async with pipeline_status_lock:
+                            pipeline_status["latest_message"] = no_cache_msg
+                            pipeline_status["history_messages"].append(no_cache_msg)
+                        raise Exception(no_cache_msg)
+                    try:
+                        deletion_stage = "delete_llm_cache"
+                        await self.llm_response_cache.delete(metadata_cache_ids)
+                        remaining_cache_ids = await self._get_existing_llm_cache_ids(
+                            metadata_cache_ids
+                        )
+                        if remaining_cache_ids:
+                            raise Exception(
+                                f"{len(remaining_cache_ids)} LLM cache entries still exist after delete"
+                            )
+                        logger.info(
+                            "Cleaned up %d LLM cache entries from prior attempt for document %s",
+                            len(metadata_cache_ids),
+                            doc_id,
+                        )
+                    except Exception as cache_err:
+                        raise Exception(
+                            f"Failed to delete LLM cache for document {doc_id}: {cache_err}"
+                        ) from cache_err
+
                 try:
-                    # Still need to delete the doc status and full doc
-                    await self.full_docs.delete([doc_id])
+                    # Still need to delete the doc status and full doc.
+                    # Delete doc_status first: if full_docs.delete fails on retry, the
+                    # doc_status record is already gone so the retry finds no record and
+                    # treats the document as already deleted rather than creating a zombie.
+                    deletion_stage = "delete_doc_entries"
                     await self.doc_status.delete([doc_id])
+                    await self.full_docs.delete([doc_id])
                 except Exception as e:
                     logger.error(
                         f"Failed to delete document {doc_id} with no chunks: {e}"
@@ -2730,6 +3548,7 @@ class LightRAG:
                     pipeline_status["latest_message"] = log_message
                     pipeline_status["history_messages"].append(log_message)
 
+                deletion_fully_completed = True
                 return DeletionResult(
                     status="success",
                     doc_id=doc_id,
@@ -2741,13 +3560,93 @@ class LightRAG:
             # Mark that deletion operations have started
             deletion_operations_started = True
 
+            if chunk_ids:
+                # Always collect/persist cache IDs for chunk-backed documents, even when
+                # this call does not request cache deletion. If a delete fails after the
+                # chunks/graph have already been removed, a later retry may turn on
+                # delete_llm_cache=True, and doc_status metadata is then the only durable
+                # place left to recover the cache keys for cleanup.
+                deletion_stage = "collect_llm_cache"
+                doc_llm_cache_ids = list(metadata_cache_ids)
+                if not self.text_chunks:
+                    logger.info(
+                        "Skipping LLM cache id collection for document %s because text chunk storage is unavailable",
+                        doc_id,
+                    )
+                else:
+                    try:
+                        chunk_data_list = await self.text_chunks.get_by_ids(
+                            list(chunk_ids)
+                        )
+                        seen_cache_ids: set[str] = set(doc_llm_cache_ids)
+                        for chunk_data in chunk_data_list:
+                            if not chunk_data or not isinstance(chunk_data, dict):
+                                continue
+                            cache_ids = chunk_data.get("llm_cache_list", [])
+                            if not isinstance(cache_ids, list):
+                                continue
+                            for cache_id in cache_ids:
+                                if (
+                                    isinstance(cache_id, str)
+                                    and cache_id
+                                    and cache_id not in seen_cache_ids
+                                ):
+                                    doc_llm_cache_ids.append(cache_id)
+                                    seen_cache_ids.add(cache_id)
+                    except Exception as cache_collect_error:
+                        logger.error(
+                            "Failed to collect LLM cache ids for document %s: %s",
+                            doc_id,
+                            cache_collect_error,
+                        )
+                        raise Exception(
+                            f"Failed to collect LLM cache ids for document {doc_id}: {cache_collect_error}"
+                        ) from cache_collect_error
+
+                if doc_llm_cache_ids:
+                    try:
+                        doc_status_data = await self._update_delete_retry_state(
+                            doc_id,
+                            doc_status_data,
+                            deletion_stage=deletion_stage,
+                            doc_llm_cache_ids=doc_llm_cache_ids,
+                            failed=False,
+                        )
+                    except Exception as status_write_error:
+                        logger.error(
+                            "Failed to persist LLM cache IDs for document %s to retry state: %s",
+                            doc_id,
+                            status_write_error,
+                        )
+                        # Describe whether this is a fresh attempt or a retry so
+                        # operators can tell whether prior partial deletions exist.
+                        attempt_context = (
+                            "retry — prior partial deletions may exist"
+                            if metadata_cache_ids
+                            else "deletion not yet started"
+                        )
+                        raise Exception(
+                            f"Failed to persist LLM cache IDs for document {doc_id} "
+                            f"({attempt_context}): {status_write_error}"
+                        ) from status_write_error
+                    logger.info(
+                        "Collected %d LLM cache entries for document %s",
+                        len(doc_llm_cache_ids),
+                        doc_id,
+                    )
+                else:
+                    logger.info("No LLM cache entries found for document %s", doc_id)
+
             # 4. Analyze entities and relationships that will be affected
             entities_to_delete = set()
-            entities_to_rebuild = {}  # entity_name -> remaining_chunk_ids
+            entities_to_rebuild = {}  # entity_name -> remaining chunk id list
             relationships_to_delete = set()
-            relationships_to_rebuild = {}  # (src, tgt) -> remaining_chunk_ids
+            relationships_to_rebuild = {}  # (src, tgt) -> remaining chunk id list
+            entity_chunk_updates: dict[str, list[str]] = {}
+            relation_chunk_updates: dict[tuple[str, str], list[str]] = {}
 
             try:
+                deletion_stage = "analyze_graph_dependencies"
                 # Get affected entities and relations from full_entities and full_relations storage
                 doc_entities_data = await self.full_entities.get_by_id(doc_id)
                 doc_relations_data = await self.full_relations.get_by_id(doc_id)
@@ -2801,14 +3700,59 @@ class LightRAG:
                 # Process entities
                 for node_data in affected_nodes:
                     node_label = node_data.get("entity_id")
-                    if node_label and "source_id" in node_data:
-                        sources = set(node_data["source_id"].split(GRAPH_FIELD_SEP))
-                        remaining_sources = sources - chunk_ids
+                    if not node_label:
+                        continue
 
-                        if not remaining_sources:
-                            entities_to_delete.add(node_label)
-                        elif remaining_sources != sources:
-                            entities_to_rebuild[node_label] = remaining_sources
+                    existing_sources: list[str] = []
+                    graph_sources: list[str] = []
+                    if self.entity_chunks:
+                        stored_chunks = await self.entity_chunks.get_by_id(node_label)
+                        if stored_chunks and isinstance(stored_chunks, dict):
+                            existing_sources = [
+                                chunk_id
+                                for chunk_id in stored_chunks.get("chunk_ids", [])
+                                if chunk_id
+                            ]
+
+                    if node_data.get("source_id"):
+                        graph_sources = [
+                            chunk_id
+                            for chunk_id in node_data["source_id"].split(
+                                GRAPH_FIELD_SEP
+                            )
+                            if chunk_id
+                        ]
+
+                    if not existing_sources:
+                        existing_sources = graph_sources
+
+                    if not existing_sources:
+                        # No chunk references means this entity should be deleted
+                        entities_to_delete.add(node_label)
+                        entity_chunk_updates[node_label] = []
+                        continue
+
+                    remaining_sources = subtract_source_ids(existing_sources, chunk_ids)
+                    # `existing_sources` comes from chunk-tracking storage when available, but
+                    # graph `source_id` can still be stale after a failed prior delete. If the
+                    # graph still references any chunk being deleted in this attempt, force a
+                    # rebuild/delete so the graph metadata gets synchronized instead of being
+                    # left untouched with orphaned source references.
+                    graph_references_deleted_chunks = bool(
+                        graph_sources and set(graph_sources) & chunk_ids
+                    )
+
+                    if not remaining_sources:
+                        entities_to_delete.add(node_label)
+                        entity_chunk_updates[node_label] = []
+                    elif (
+                        remaining_sources != existing_sources
+                        or graph_references_deleted_chunks
+                    ):
+                        entities_to_rebuild[node_label] = remaining_sources
+                        entity_chunk_updates[node_label] = remaining_sources
+                    else:
+                        logger.info(f"Untouch entity: {node_label}")
 
                 async with pipeline_status_lock:
                     log_message = f"Found {len(entities_to_rebuild)} affected entities"
@@ -2818,24 +3762,72 @@ class LightRAG:
 
                 # Process relationships
                 for edge_data in affected_edges:
+                    # source target is not in normalize order in graph db property
                     src = edge_data.get("source")
                     tgt = edge_data.get("target")
 
-                    if src and tgt and "source_id" in edge_data:
-                        edge_tuple = tuple(sorted((src, tgt)))
-                        if (
-                            edge_tuple in relationships_to_delete
-                            or edge_tuple in relationships_to_rebuild
-                        ):
-                            continue
+                    if not src or not tgt or "source_id" not in edge_data:
+                        continue
 
-                        sources = set(edge_data["source_id"].split(GRAPH_FIELD_SEP))
-                        remaining_sources = sources - chunk_ids
+                    edge_tuple = tuple(sorted((src, tgt)))
+                    if (
+                        edge_tuple in relationships_to_delete
+                        or edge_tuple in relationships_to_rebuild
+                    ):
+                        continue
 
-                        if not remaining_sources:
-                            relationships_to_delete.add(edge_tuple)
-                        elif remaining_sources != sources:
-                            relationships_to_rebuild[edge_tuple] = remaining_sources
+                    existing_sources: list[str] = []
+                    graph_sources: list[str] = []
+                    if self.relation_chunks:
+                        storage_key = make_relation_chunk_key(src, tgt)
+                        stored_chunks = await self.relation_chunks.get_by_id(
+                            storage_key
+                        )
+                        if stored_chunks and isinstance(stored_chunks, dict):
+                            existing_sources = [
+                                chunk_id
+                                for chunk_id in stored_chunks.get("chunk_ids", [])
+                                if chunk_id
+                            ]
+
+                    if edge_data.get("source_id"):
+                        graph_sources = [
+                            chunk_id
+                            for chunk_id in edge_data["source_id"].split(
+                                GRAPH_FIELD_SEP
+                            )
+                            if chunk_id
+                        ]
+
+                    if not existing_sources:
+                        existing_sources = graph_sources
+
+                    if not existing_sources:
+                        # No chunk references means this relationship should be deleted
+                        relationships_to_delete.add(edge_tuple)
+                        relation_chunk_updates[edge_tuple] = []
+                        continue
+
+                    remaining_sources = subtract_source_ids(existing_sources, chunk_ids)
+                    # Same as the entity path above: even when relation chunk-tracking is already
+                    # correct, the graph edge may still carry a stale `source_id` that mentions a
+                    # chunk deleted in this attempt. Treat that as an affected relation so retry
+                    # deletion can repair the graph metadata rather than skipping it as "untouched".
+                    graph_references_deleted_chunks = bool(
+                        graph_sources and set(graph_sources) & chunk_ids
+                    )
+
+                    if not remaining_sources:
+                        relationships_to_delete.add(edge_tuple)
+                        relation_chunk_updates[edge_tuple] = []
+                    elif (
+                        remaining_sources != existing_sources
+                        or graph_references_deleted_chunks
+                    ):
+                        relationships_to_rebuild[edge_tuple] = remaining_sources
+                        relation_chunk_updates[edge_tuple] = remaining_sources
+                    else:
+                        logger.info(f"Untouch relation: {edge_tuple}")
 
                 async with pipeline_status_lock:
                     log_message = (
@@ -2845,60 +3837,151 @@ class LightRAG:
                     pipeline_status["latest_message"] = log_message
                     pipeline_status["history_messages"].append(log_message)
 
+                current_time = int(time.time())
+                deletion_stage = "update_chunk_tracking"
+
+                if entity_chunk_updates and self.entity_chunks:
+                    entity_upsert_payload = {}
+                    for entity_name, remaining in entity_chunk_updates.items():
+                        if not remaining:
+                            # Empty entities are deleted alongside graph nodes later
+                            continue
+                        entity_upsert_payload[entity_name] = {
+                            "chunk_ids": remaining,
+                            "count": len(remaining),
+                            "updated_at": current_time,
+                        }
+                    if entity_upsert_payload:
+                        await self.entity_chunks.upsert(entity_upsert_payload)
+
+                if relation_chunk_updates and self.relation_chunks:
+                    relation_upsert_payload = {}
+                    for edge_tuple, remaining in relation_chunk_updates.items():
+                        if not remaining:
+                            # Empty relations are deleted alongside graph edges later
+                            continue
+                        storage_key = make_relation_chunk_key(*edge_tuple)
+                        relation_upsert_payload[storage_key] = {
+                            "chunk_ids": remaining,
+                            "count": len(remaining),
+                            "updated_at": current_time,
+                        }
+
+                    if relation_upsert_payload:
+                        await self.relation_chunks.upsert(relation_upsert_payload)
+
             except Exception as e:
                 logger.error(f"Failed to process graph analysis results: {e}")
                 raise Exception(f"Failed to process graph dependencies: {e}") from e
 
-            # Use graph database lock to prevent dirty read
-            graph_db_lock = get_graph_db_lock(enable_logging=False)
-            async with graph_db_lock:
-                # 5. Delete chunks from storage
-                if chunk_ids:
-                    try:
-                        await self.chunks_vdb.delete(chunk_ids)
-                        await self.text_chunks.delete(chunk_ids)
+            # Data integrity is ensured by allowing only one process to hold pipeline at a time（no graph db lock is needed anymore)
 
-                        async with pipeline_status_lock:
-                            log_message = f"Successfully deleted {len(chunk_ids)} chunks from storage"
-                            logger.info(log_message)
-                            pipeline_status["latest_message"] = log_message
-                            pipeline_status["history_messages"].append(log_message)
+            # 5. Delete chunks from storage
+            if chunk_ids:
+                try:
+                    deletion_stage = "delete_chunks"
+                    await self.chunks_vdb.delete(chunk_ids)
+                    await self.text_chunks.delete(chunk_ids)
 
-                    except Exception as e:
-                        logger.error(f"Failed to delete chunks: {e}")
-                        raise Exception(f"Failed to delete document chunks: {e}") from e
+                    async with pipeline_status_lock:
+                        log_message = (
+                            f"Successfully deleted {len(chunk_ids)} chunks from storage"
+                        )
+                        logger.info(log_message)
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
 
-                # 6. Delete entities that have no remaining sources
-                if entities_to_delete:
-                    try:
-                        # Delete from vector database
-                        entity_vdb_ids = [
-                            compute_mdhash_id(entity, prefix="ent-")
-                            for entity in entities_to_delete
+                except Exception as e:
+                    logger.error(f"Failed to delete chunks: {e}")
+                    raise Exception(f"Failed to delete document chunks: {e}") from e
+
+            # 6. Delete relationships that have no remaining sources
+            if relationships_to_delete:
+                try:
+                    deletion_stage = "delete_relationships"
+                    # Delete from relation vdb
+                    rel_ids_to_delete = []
+                    for src, tgt in relationships_to_delete:
+                        rel_ids_to_delete.extend(
+                            [
+                                compute_mdhash_id(src + tgt, prefix="rel-"),
+                                compute_mdhash_id(tgt + src, prefix="rel-"),
+                            ]
+                        )
+                    await self.relationships_vdb.delete(rel_ids_to_delete)
+
+                    # Delete from graph
+                    await self.chunk_entity_relation_graph.remove_edges(
+                        list(relationships_to_delete)
+                    )
+
+                    # Delete from relation_chunks storage
+                    if self.relation_chunks:
+                        relation_storage_keys = [
+                            make_relation_chunk_key(src, tgt)
+                            for src, tgt in relationships_to_delete
                         ]
-                        await self.entities_vdb.delete(entity_vdb_ids)
+                        await self.relation_chunks.delete(relation_storage_keys)
 
-                        # Delete from graph
-                        await self.chunk_entity_relation_graph.remove_nodes(
+                    async with pipeline_status_lock:
+                        log_message = f"Successfully deleted {len(relationships_to_delete)} relations"
+                        logger.info(log_message)
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+
+                except Exception as e:
+                    logger.error(f"Failed to delete relationships: {e}")
+                    raise Exception(f"Failed to delete relationships: {e}") from e
+
+            # 7. Delete entities that have no remaining sources
+            if entities_to_delete:
+                try:
+                    deletion_stage = "delete_entities"
+                    # Batch get all edges for entities to avoid N+1 query problem
+                    nodes_edges_dict = (
+                        await self.chunk_entity_relation_graph.get_nodes_edges_batch(
                             list(entities_to_delete)
                         )
+                    )
 
-                        async with pipeline_status_lock:
-                            log_message = f"Successfully deleted {len(entities_to_delete)} entities"
-                            logger.info(log_message)
-                            pipeline_status["latest_message"] = log_message
-                            pipeline_status["history_messages"].append(log_message)
+                    # Debug: Check and log all edges before deleting nodes
+                    edges_to_delete = set()
+                    edges_still_exist = 0
 
-                    except Exception as e:
-                        logger.error(f"Failed to delete entities: {e}")
-                        raise Exception(f"Failed to delete entities: {e}") from e
+                    for entity, edges in nodes_edges_dict.items():
+                        if edges:
+                            for src, tgt in edges:
+                                # Normalize edge representation (sorted for consistency)
+                                edge_tuple = tuple(sorted((src, tgt)))
+                                edges_to_delete.add(edge_tuple)
 
-                # 7. Delete relationships that have no remaining sources
-                if relationships_to_delete:
-                    try:
-                        # Delete from vector database
+                                if (
+                                    src in entities_to_delete
+                                    and tgt in entities_to_delete
+                                ):
+                                    logger.warning(
+                                        f"Edge still exists: {src} <-> {tgt}"
+                                    )
+                                elif src in entities_to_delete:
+                                    logger.warning(
+                                        f"Edge still exists: {src} --> {tgt}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Edge still exists: {src} <-- {tgt}"
+                                    )
+                            edges_still_exist += 1
+
+                    if edges_still_exist:
+                        logger.warning(
+                            f"⚠️ {edges_still_exist} entities still has edges before deletion"
+                        )
+
+                    # Clean residual edges from VDB and storage before deleting nodes
+                    if edges_to_delete:
+                        # Delete from relationships_vdb
                         rel_ids_to_delete = []
-                        for src, tgt in relationships_to_delete:
+                        for src, tgt in edges_to_delete:
                             rel_ids_to_delete.extend(
                                 [
                                     compute_mdhash_id(src + tgt, prefix="rel-"),
@@ -2907,28 +3990,59 @@ class LightRAG:
                             )
                         await self.relationships_vdb.delete(rel_ids_to_delete)
 
-                        # Delete from graph
-                        await self.chunk_entity_relation_graph.remove_edges(
-                            list(relationships_to_delete)
+                        # Delete from relation_chunks storage
+                        if self.relation_chunks:
+                            relation_storage_keys = [
+                                make_relation_chunk_key(src, tgt)
+                                for src, tgt in edges_to_delete
+                            ]
+                            await self.relation_chunks.delete(relation_storage_keys)
+
+                        logger.info(
+                            f"Cleaned {len(edges_to_delete)} residual edges from VDB and chunk-tracking storage"
                         )
 
-                        async with pipeline_status_lock:
-                            log_message = f"Successfully deleted {len(relationships_to_delete)} relations"
-                            logger.info(log_message)
-                            pipeline_status["latest_message"] = log_message
-                            pipeline_status["history_messages"].append(log_message)
+                    # Delete from graph (edges will be auto-deleted with nodes)
+                    await self.chunk_entity_relation_graph.remove_nodes(
+                        list(entities_to_delete)
+                    )
 
-                    except Exception as e:
-                        logger.error(f"Failed to delete relationships: {e}")
-                        raise Exception(f"Failed to delete relationships: {e}") from e
+                    # Delete from vector vdb
+                    entity_vdb_ids = [
+                        compute_mdhash_id(entity, prefix="ent-")
+                        for entity in entities_to_delete
+                    ]
+                    await self.entities_vdb.delete(entity_vdb_ids)
 
-                # Persist changes to graph database before releasing graph database lock
+                    # Delete from entity_chunks storage
+                    if self.entity_chunks:
+                        await self.entity_chunks.delete(list(entities_to_delete))
+
+                    async with pipeline_status_lock:
+                        log_message = (
+                            f"Successfully deleted {len(entities_to_delete)} entities"
+                        )
+                        logger.info(log_message)
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+
+                except Exception as e:
+                    logger.error(f"Failed to delete entities: {e}")
+                    raise Exception(f"Failed to delete entities: {e}") from e
+
+            # Persist changes to graph database before entity and relationship rebuild
+            try:
+                deletion_stage = "persist_pre_rebuild_changes"
                 await self._insert_done()
+            except Exception as e:
+                logger.error(f"Failed to persist pre-rebuild changes: {e}")
+                raise Exception(f"Failed to persist pre-rebuild changes: {e}") from e
 
             # 8. Rebuild entities and relationships from remaining chunks
             if entities_to_rebuild or relationships_to_rebuild:
                 try:
-                    await _rebuild_knowledge_from_chunks(
+                    deletion_stage = "rebuild_knowledge_graph"
+                    await rebuild_knowledge_from_chunks(
                         entities_to_rebuild=entities_to_rebuild,
                         relationships_to_rebuild=relationships_to_rebuild,
                         knowledge_graph_inst=self.chunk_entity_relation_graph,
@@ -2939,14 +4053,63 @@ class LightRAG:
                         global_config=asdict(self),
                         pipeline_status=pipeline_status,
                         pipeline_status_lock=pipeline_status_lock,
+                        entity_chunks_storage=self.entity_chunks,
+                        relation_chunks_storage=self.relation_chunks,
                     )
 
                 except Exception as e:
                     logger.error(f"Failed to rebuild knowledge from chunks: {e}")
                     raise Exception(f"Failed to rebuild knowledge graph: {e}") from e
 
-            # 9. Delete from full_entities and full_relations storage
+            # 9. Delete LLM cache while the document status still exists so a failure
+            # remains retryable via the same doc_id.
+            log_message = f"Document {doc_id} successfully deleted"
+            if delete_llm_cache and doc_llm_cache_ids:
+                if not self.llm_response_cache:
+                    log_message = (
+                        f"Cannot delete LLM cache for document {doc_id}: "
+                        "cache storage is unavailable"
+                    )
+                    logger.error(log_message)
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+                    raise Exception(log_message)
+                try:
+                    deletion_stage = "delete_llm_cache"
+                    await self.llm_response_cache.delete(doc_llm_cache_ids)
+                    # Some storage implementations do not raise on delete errors and
+                    # instead only log internally, so confirm the cache entries are
+                    # actually gone before deleting the document/status records.
+                    remaining_cache_ids = await self._get_existing_llm_cache_ids(
+                        doc_llm_cache_ids
+                    )
+                    if remaining_cache_ids:
+                        doc_llm_cache_ids = remaining_cache_ids
+                        raise Exception(
+                            f"{len(remaining_cache_ids)} LLM cache entries still exist after delete"
+                        )
+                    cache_log_message = f"Successfully deleted {len(doc_llm_cache_ids)} LLM cache entries for document {doc_id}"
+                    logger.info(cache_log_message)
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = cache_log_message
+                        pipeline_status["history_messages"].append(cache_log_message)
+                    log_message = cache_log_message
+                except Exception as cache_delete_error:
+                    log_message = (
+                        f"Failed to delete LLM cache for document {doc_id}: "
+                        f"{cache_delete_error}"
+                    )
+                    logger.error(log_message)
+                    logger.error(traceback.format_exc())
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+                    raise Exception(log_message) from cache_delete_error
+
+            # 10. Delete from full_entities and full_relations storage
             try:
+                deletion_stage = "delete_doc_graph_metadata"
                 await self.full_entities.delete([doc_id])
                 await self.full_relations.delete([doc_id])
             except Exception as e:
@@ -2955,14 +4118,20 @@ class LightRAG:
                     f"Failed to delete from full_entities/full_relations: {e}"
                 ) from e
 
-            # 10. Delete original document and status
+            # 11. Delete original document and status.
+            # doc_status is deleted first so that if full_docs.delete fails, a retry
+            # finds no doc_status record and treats the document as already gone,
+            # rather than finding a doc_status that points to a missing full_docs entry.
             try:
-                await self.full_docs.delete([doc_id])
+                deletion_stage = "delete_doc_entries"
+                in_final_delete_stage = True
                 await self.doc_status.delete([doc_id])
+                await self.full_docs.delete([doc_id])
             except Exception as e:
                 logger.error(f"Failed to delete document and status: {e}")
                 raise Exception(f"Failed to delete document and status: {e}") from e
 
+            deletion_fully_completed = True
             return DeletionResult(
                 status="success",
                 doc_id=doc_id,
@@ -2976,6 +4145,31 @@ class LightRAG:
             error_message = f"Error while deleting document {doc_id}: {e}"
             logger.error(error_message)
             logger.error(traceback.format_exc())
+            try:
+                # Do not attempt to write retry state if doc_status was already deleted:
+                # upsert would re-create the record as a zombie. All earlier stages still
+                # have doc_status intact and can safely update it, even if some chunk/graph
+                # data has already been removed.
+                if doc_status_data is not None and not in_final_delete_stage:
+                    doc_status_data = await self._update_delete_retry_state(
+                        doc_id,
+                        doc_status_data,
+                        deletion_stage=deletion_stage,
+                        doc_llm_cache_ids=doc_llm_cache_ids,
+                        error_message=error_message,
+                        failed=True,
+                    )
+            except Exception as status_update_error:
+                logger.error(
+                    "Failed to update deletion retry state for document %s: %s",
+                    doc_id,
+                    status_update_error,
+                )
+                logger.error(traceback.format_exc())
+                error_message = (
+                    f"{error_message}. Additionally, failed to persist retry state: "
+                    f"{status_update_error}. Manual cleanup may be required."
+                )
             return DeletionResult(
                 status="fail",
                 doc_id=doc_id,
@@ -2994,8 +4188,18 @@ class LightRAG:
                     logger.error(persistence_error_msg)
                     logger.error(traceback.format_exc())
 
-                    # If there was no original exception, this persistence error becomes the main error
-                    if original_exception is None:
+                    if deletion_fully_completed:
+                        # All deletion stages succeeded; the flush error is a post-cleanup
+                        # concern. Do not override the success result already returned.
+                        logger.error(
+                            "Post-deletion persistence flush failed for %s, "
+                            "but deletion completed successfully: %s",
+                            doc_id,
+                            persistence_error,
+                        )
+                    elif original_exception is None:
+                        # Deletion stages were in-flight but the try-block return was never
+                        # reached; treat the persistence failure as the primary error.
                         return DeletionResult(
                             status="fail",
                             doc_id=doc_id,
@@ -3003,12 +4207,24 @@ class LightRAG:
                             status_code=500,
                             file_path=file_path,
                         )
-                    # If there was an original exception, log the persistence error but don't override the original error
-                    # The original error result was already returned in the except block
+                    # If there was an original exception, log the persistence error but
+                    # don't override it — the original error result was already returned.
             else:
                 logger.debug(
                     f"No deletion operations were started for document {doc_id}, skipping persistence"
                 )
+
+            # Release pipeline only if WE acquired it
+            if we_acquired_pipeline:
+                async with pipeline_status_lock:
+                    pipeline_status["busy"] = False
+                    pipeline_status["cancellation_requested"] = False
+                    completion_msg = (
+                        f"Deletion process completed for document: {doc_id}"
+                    )
+                    pipeline_status["latest_message"] = completion_msg
+                    pipeline_status["history_messages"].append(completion_msg)
+                    logger.info(completion_msg)
 
     async def adelete_by_entity(self, entity_name: str) -> DeletionResult:
         """Asynchronously delete an entity and all its relationships.
@@ -3127,16 +4343,22 @@ class LightRAG:
         )
 
     async def aedit_entity(
-        self, entity_name: str, updated_data: dict[str, str], allow_rename: bool = True
+        self,
+        entity_name: str,
+        updated_data: dict[str, str],
+        allow_rename: bool = True,
+        allow_merge: bool = False,
     ) -> dict[str, Any]:
         """Asynchronously edit entity information.
 
         Updates entity information in the knowledge graph and re-embeds the entity in the vector database.
+        Also synchronizes entity_chunks_storage and relation_chunks_storage to track chunk references.
 
         Args:
             entity_name: Name of the entity to edit
             updated_data: Dictionary containing updated attributes, e.g. {"description": "new description", "entity_type": "new type"}
             allow_rename: Whether to allow entity renaming, defaults to True
+            allow_merge: Whether to merge into an existing entity when renaming to an existing name
 
         Returns:
             Dictionary containing updated entity information
@@ -3150,14 +4372,21 @@ class LightRAG:
             entity_name,
             updated_data,
             allow_rename,
+            allow_merge,
+            self.entity_chunks,
+            self.relation_chunks,
         )
 
     def edit_entity(
-        self, entity_name: str, updated_data: dict[str, str], allow_rename: bool = True
+        self,
+        entity_name: str,
+        updated_data: dict[str, str],
+        allow_rename: bool = True,
+        allow_merge: bool = False,
     ) -> dict[str, Any]:
         loop = always_get_an_event_loop()
         return loop.run_until_complete(
-            self.aedit_entity(entity_name, updated_data, allow_rename)
+            self.aedit_entity(entity_name, updated_data, allow_rename, allow_merge)
         )
 
     async def aedit_relation(
@@ -3166,6 +4395,7 @@ class LightRAG:
         """Asynchronously edit relation information.
 
         Updates relation (edge) information in the knowledge graph and re-embeds the relation in the vector database.
+        Also synchronizes the relation_chunks_storage to track which chunks reference this relation.
 
         Args:
             source_entity: Name of the source entity
@@ -3184,6 +4414,7 @@ class LightRAG:
             source_entity,
             target_entity,
             updated_data,
+            self.relation_chunks,
         )
 
     def edit_relation(
@@ -3295,6 +4526,8 @@ class LightRAG:
             target_entity,
             merge_strategy,
             target_entity_data,
+            self.entity_chunks,
+            self.relation_chunks,
         )
 
     def merge_entities(

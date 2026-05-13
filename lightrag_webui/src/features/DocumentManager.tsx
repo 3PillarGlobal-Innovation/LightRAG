@@ -18,10 +18,19 @@ import UploadDocumentsDialog from '@/components/documents/UploadDocumentsDialog'
 import ClearDocumentsDialog from '@/components/documents/ClearDocumentsDialog'
 import DeleteDocumentsDialog from '@/components/documents/DeleteDocumentsDialog'
 import PaginationControls from '@/components/ui/PaginationControls'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger
+} from '@/components/ui/Dialog'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
 
 import {
   scanNewDocuments,
-  getDocumentsPaginated,
+  getDocumentsPaginatedWithTimeout,
   DocsStatusesResponse,
   DocStatus,
   DocStatusResponse,
@@ -31,12 +40,28 @@ import {
 import { errorMessage } from '@/lib/utils'
 import { toast } from 'sonner'
 import { useBackendState } from '@/stores/state'
+import { copyToClipboard } from '@/utils/clipboard'
 
-import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info } from 'lucide-react'
+import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info, CopyIcon } from 'lucide-react'
 import PipelineStatusDialog from '@/components/documents/PipelineStatusDialog'
 
 type StatusFilter = DocStatus | 'all';
 
+// Utility functions defined outside component for better performance and to avoid dependency issues
+const getCountValue = (counts: Record<string, number>, ...keys: string[]): number => {
+  for (const key of keys) {
+    const value = counts[key]
+    if (typeof value === 'number') {
+      return value
+    }
+  }
+  return 0
+}
+
+const hasActiveDocumentsStatus = (counts: Record<string, number>): boolean =>
+  getCountValue(counts, 'PROCESSING', 'processing') > 0 ||
+  getCountValue(counts, 'PENDING', 'pending') > 0 ||
+  getCountValue(counts, 'PREPROCESSED', 'preprocessed') > 0
 
 const getDisplayFileName = (doc: DocStatusResponse, maxLength: number = 20): string => {
   // Check if file_path exists and is a non-empty string
@@ -76,62 +101,115 @@ const formatMetadata = (metadata: Record<string, any>): string => {
     }
   }
 
-  return JSON.stringify(formattedMetadata, null, 2);
+  // Format JSON and remove outer braces and indentation
+  const jsonStr = JSON.stringify(formattedMetadata, null, 2);
+  const lines = jsonStr.split('\n');
+  // Remove first line ({) and last line (}), and remove leading indentation (2 spaces)
+  return lines.slice(1, -1)
+    .map(line => line.replace(/^ {2}/, ''))
+    .join('\n');
 };
 
+const hasDocumentDetails = (doc: DocStatusResponse): boolean => {
+  return Boolean(
+    doc.track_id ||
+    doc.error_msg ||
+    (doc.metadata && Object.keys(doc.metadata).length > 0)
+  )
+}
+
+const formatDocumentDetails = (doc: DocStatusResponse): string => {
+  const details: string[] = []
+
+  if (doc.track_id) {
+    details.push(`Track ID: ${doc.track_id}`)
+  }
+
+  if (doc.metadata && Object.keys(doc.metadata).length > 0) {
+    details.push(formatMetadata(doc.metadata))
+  }
+
+  if (doc.error_msg) {
+    details.push(`Error Message:\n${doc.error_msg}`)
+  }
+
+  return details.join('\n\n')
+}
+
+const DocumentStatusDetailsDialog = ({ doc }: { doc: DocStatusResponse }) => {
+  const { t } = useTranslation()
+  const details = formatDocumentDetails(doc)
+
+  const openLabel = t('documentPanel.documentManager.details.openTooltip')
+  const copyLabel = t('documentPanel.documentManager.details.copyTooltip')
+
+  const handleCopy = async () => {
+    const result = await copyToClipboard(details)
+
+    if (result.success) {
+      toast.success(t('documentPanel.documentManager.details.copySuccess'))
+    } else {
+      toast.error(t('documentPanel.documentManager.details.copyFailed'))
+    }
+  }
+
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="ml-2 size-7"
+          tooltip={openLabel}
+          side="top"
+          aria-label={openLabel}
+        >
+          {doc.error_msg ? (
+            <AlertTriangle className="h-4 w-4 text-yellow-500" />
+          ) : (
+            <Info className="h-4 w-4 text-blue-500" />
+          )}
+        </Button>
+      </DialogTrigger>
+      <DialogContent
+        className="max-w-2xl"
+        onOpenAutoFocus={(e) => {
+          e.preventDefault()
+          ;(e.currentTarget as HTMLElement | null)?.focus()
+        }}
+        onCloseAutoFocus={(e) => e.preventDefault()}
+      >
+        <DialogHeader>
+          <DialogTitle>{t('documentPanel.documentManager.details.title')}</DialogTitle>
+          <DialogDescription className="break-all">
+            {doc.id}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="relative rounded-md border bg-muted/30">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="absolute top-2 right-2 z-10 size-7 bg-background/80 hover:bg-accent"
+            onClick={handleCopy}
+            tooltip={copyLabel}
+            side="left"
+            aria-label={copyLabel}
+          >
+            <CopyIcon className="h-4 w-4" />
+          </Button>
+          <div className="max-h-[60vh] overflow-y-auto p-3 pr-12">
+            <pre className="whitespace-pre-wrap break-words text-sm">{details}</pre>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 const pulseStyle = `
-/* Tooltip styles */
-.tooltip-container {
-  position: relative;
-  overflow: visible !important;
-}
-
-.tooltip {
-  position: fixed; /* Use fixed positioning to escape overflow constraints */
-  z-index: 9999; /* Ensure tooltip appears above all other elements */
-  max-width: 600px;
-  white-space: normal;
-  word-break: break-word;
-  overflow-wrap: break-word;
-  border-radius: 0.375rem;
-  padding: 0.5rem 0.75rem;
-  font-size: 0.75rem; /* 12px */
-  background-color: rgba(0, 0, 0, 0.95);
-  color: white;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-  pointer-events: none; /* Prevent tooltip from interfering with mouse events */
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity 0.15s, visibility 0.15s;
-}
-
-.tooltip.visible {
-  opacity: 1;
-  visibility: visible;
-}
-
-.dark .tooltip {
-  background-color: rgba(255, 255, 255, 0.95);
-  color: black;
-}
-
-.tooltip pre {
-  white-space: pre-wrap;
-  word-break: break-word;
-  overflow-wrap: break-word;
-}
-
-/* Position tooltip helper class */
-.tooltip-helper {
-  position: absolute;
-  visibility: hidden;
-  pointer-events: none;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 0;
-}
-
 @keyframes pulse {
   0% {
     background-color: rgb(255 0 0 / 0.1);
@@ -175,6 +253,25 @@ const pulseStyle = `
 // Type definitions for sort field and direction
 type SortField = 'created_at' | 'updated_at' | 'id' | 'file_path';
 type SortDirection = 'asc' | 'desc';
+type QuerySnapshot = {
+  statusFilter: StatusFilter
+  page: number
+  pageSize: number
+  sortField: SortField
+  sortDirection: SortDirection
+}
+type RefreshRequest =
+  | {
+    type: 'intelligent';
+    query: QuerySnapshot;
+    customTimeout?: number;
+    requestVersion: number;
+  }
+  | {
+    type: 'manual';
+    query: QuerySnapshot;
+    requestVersion: number;
+  };
 
 export default function DocumentManager() {
   // Track component mount status
@@ -210,6 +307,7 @@ export default function DocumentManager() {
   const setShowFileName = useSettingsStore.use.setShowFileName()
   const documentsPageSize = useSettingsStore.use.documentsPageSize()
   const setDocumentsPageSize = useSettingsStore.use.setDocumentsPageSize()
+  const workspace = useSettingsStore.use.workspace()
 
   // New pagination state
   const [currentPageDocs, setCurrentPageDocs] = useState<DocStatusResponse[]>([])
@@ -235,6 +333,7 @@ export default function DocumentManager() {
   const [pageByStatus, setPageByStatus] = useState<Record<StatusFilter, number>>({
     all: 1,
     processed: 1,
+    preprocessed: 1,
     processing: 1,
     pending: 1,
     failed: 1,
@@ -247,6 +346,9 @@ export default function DocumentManager() {
   // Add refs to track previous pipelineBusy state and current interval
   const prevPipelineBusyRef = useRef<boolean | undefined>(undefined);
   const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeRefreshPromiseRef = useRef<Promise<void> | null>(null);
+  const pendingRefreshRequestRef = useRef<RefreshRequest | null>(null);
+  const latestRefreshRequestVersionRef = useRef(0);
 
   // Add retry mechanism state
   const [retryState, setRetryState] = useState({
@@ -301,6 +403,7 @@ export default function DocumentManager() {
     setPageByStatus({
       all: 1,
       processed: 1,
+      preprocessed: 1,
       processing: 1,
       pending: 1,
       failed: 1,
@@ -445,9 +548,19 @@ export default function DocumentManager() {
     return counts;
   }, [docs]);
 
+  const processedCount = getCountValue(statusCounts, 'PROCESSED', 'processed') || documentCounts.processed || 0;
+  const preprocessedCount =
+    getCountValue(statusCounts, 'PREPROCESSED', 'preprocessed') ||
+    documentCounts.preprocessed ||
+    0;
+  const processingCount = getCountValue(statusCounts, 'PROCESSING', 'processing') || documentCounts.processing || 0;
+  const pendingCount = getCountValue(statusCounts, 'PENDING', 'pending') || documentCounts.pending || 0;
+  const failedCount = getCountValue(statusCounts, 'FAILED', 'failed') || documentCounts.failed || 0;
+
   // Store previous status counts
   const prevStatusCounts = useRef({
     processed: 0,
+    preprocessed: 0,
     processing: 0,
     pending: 0,
     failed: 0
@@ -466,67 +579,26 @@ export default function DocumentManager() {
   // Reference to the card content element
   const cardContentRef = useRef<HTMLDivElement>(null);
 
-  // Add tooltip position adjustment for fixed positioning
-  useEffect(() => {
-    if (!docs) return;
+  const buildQuerySnapshot = useCallback((
+    overrides: Partial<QuerySnapshot> = {}
+  ): QuerySnapshot => ({
+    statusFilter: overrides.statusFilter ?? statusFilter,
+    page: overrides.page ?? pagination.page,
+    pageSize: overrides.pageSize ?? pagination.page_size,
+    sortField: overrides.sortField ?? sortField,
+    sortDirection: overrides.sortDirection ?? sortDirection
+  }), [pagination.page, pagination.page_size, sortField, sortDirection, statusFilter])
 
-    // Function to position tooltips
-    const positionTooltips = () => {
-      // Get all tooltip containers
-      const containers = document.querySelectorAll<HTMLElement>('.tooltip-container');
-
-      containers.forEach(container => {
-        const tooltip = container.querySelector<HTMLElement>('.tooltip');
-        if (!tooltip) return;
-
-        // Skip tooltips that aren't visible
-        if (!tooltip.classList.contains('visible')) return;
-
-        // Get container position
-        const rect = container.getBoundingClientRect();
-
-        // Position tooltip above the container
-        tooltip.style.left = `${rect.left}px`;
-        tooltip.style.top = `${rect.top - 5}px`;
-        tooltip.style.transform = 'translateY(-100%)';
-      });
-    };
-
-    // Set up event listeners
-    const handleMouseOver = (e: MouseEvent) => {
-      // Check if target or its parent is a tooltip container
-      const target = e.target as HTMLElement;
-      const container = target.closest('.tooltip-container');
-      if (!container) return;
-
-      // Find tooltip and make it visible
-      const tooltip = container.querySelector<HTMLElement>('.tooltip');
-      if (tooltip) {
-        tooltip.classList.add('visible');
-        // Position immediately without delay
-        positionTooltips();
-      }
-    };
-
-    const handleMouseOut = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      const container = target.closest('.tooltip-container');
-      if (!container) return;
-
-      const tooltip = container.querySelector<HTMLElement>('.tooltip');
-      if (tooltip) {
-        tooltip.classList.remove('visible');
-      }
-    };
-
-    document.addEventListener('mouseover', handleMouseOver);
-    document.addEventListener('mouseout', handleMouseOut);
-
-    return () => {
-      document.removeEventListener('mouseover', handleMouseOver);
-      document.removeEventListener('mouseout', handleMouseOut);
-    };
-  }, [docs]);
+  const buildDocumentsRequest = useCallback((
+    query: QuerySnapshot,
+    page: number = query.page
+  ): DocumentsRequest => ({
+    status_filter: query.statusFilter === 'all' ? null : query.statusFilter,
+    page,
+    page_size: query.pageSize,
+    sort_field: query.sortField,
+    sort_direction: query.sortDirection
+  }), [])
 
   // Utility function to update component state
   const updateComponentState = useCallback((response: any) => {
@@ -538,6 +610,7 @@ export default function DocumentManager() {
     const legacyDocs: DocsStatusesResponse = {
       statuses: {
         processed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'processed'),
+        preprocessed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'preprocessed'),
         processing: response.documents.filter((doc: DocStatusResponse) => doc.status === 'processing'),
         pending: response.documents.filter((doc: DocStatusResponse) => doc.status === 'pending'),
         failed: response.documents.filter((doc: DocStatusResponse) => doc.status === 'failed')
@@ -545,18 +618,6 @@ export default function DocumentManager() {
     };
 
     setDocs(response.pagination.total_count > 0 ? legacyDocs : null);
-  }, []);
-
-  // Utility function to create timeout wrapper for API calls
-  const withTimeout = useCallback((
-    promise: Promise<any>,
-    timeoutMs: number = 30000,
-    errorMsg: string = 'Request timeout'
-  ): Promise<any> => {
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(errorMsg)), timeoutMs)
-    });
-    return Promise.race([promise, timeoutPromise]);
   }, []);
 
 
@@ -639,68 +700,98 @@ export default function DocumentManager() {
     });
   }, []);
 
-  // Intelligent refresh function: handles all boundary cases
-  const handleIntelligentRefresh = useCallback(async (
-    targetPage?: number, // Optional target page, defaults to current page
-    resetToFirst?: boolean // Whether to force reset to first page
-  ) => {
+  // Handle page size change - update state and save to store
+  const handlePageSizeChange = useCallback((newPageSize: number) => {
+    if (newPageSize === pagination.page_size) return;
+
+    // Save the new page size to the store
+    setDocumentsPageSize(newPageSize);
+
+    // Reset all status filters to page 1 when page size changes
+    setPageByStatus({
+      all: 1,
+      processed: 1,
+      preprocessed: 1,
+      processing: 1,
+      pending: 1,
+      failed: 1,
+    });
+
+    setPagination(prev => ({ ...prev, page: 1, page_size: newPageSize }));
+  }, [pagination.page_size, setDocumentsPageSize]);
+
+  const runRefreshRequest = useCallback(async (refreshRequest: RefreshRequest) => {
     try {
       if (!isMountedRef.current) return;
 
       setIsRefreshing(true);
 
-      // Determine target page
-      const pageToFetch = resetToFirst ? 1 : (targetPage || pagination.page);
+      const { query, requestVersion } = refreshRequest
+      const isStaleRequest = () => requestVersion !== latestRefreshRequestVersionRef.current
 
-      const request: DocumentsRequest = {
-        status_filter: statusFilter === 'all' ? null : statusFilter,
-        page: pageToFetch,
-        page_size: pagination.page_size,
-        sort_field: sortField,
-        sort_direction: sortDirection
-      };
+      if (refreshRequest.type === 'manual') {
+        const request = buildDocumentsRequest(query, 1)
+        const response = await getDocumentsPaginatedWithTimeout(request)
 
-      // Use timeout wrapper for the API call
-      const response = await withTimeout(
-        getDocumentsPaginated(request),
-        30000, // 30 second timeout
-        'Document fetch timeout'
-      );
+        if (!isMountedRef.current || isStaleRequest()) return;
 
-      if (!isMountedRef.current) return;
+        if (response.pagination.total_count < query.pageSize && query.pageSize !== 10) {
+          handlePageSizeChange(10);
+        } else {
+          setPagination(response.pagination);
+          setCurrentPageDocs(response.documents);
+          setStatusCounts(response.status_counts);
 
-      // Boundary case handling: if target page has no data but total count > 0
-      if (response.documents.length === 0 && response.pagination.total_count > 0) {
-        // Calculate last page
-        const lastPage = Math.max(1, response.pagination.total_pages);
-
-        if (pageToFetch !== lastPage) {
-          // Re-request last page
-          const lastPageRequest: DocumentsRequest = {
-            ...request,
-            page: lastPage
+          const legacyDocs: DocsStatusesResponse = {
+            statuses: {
+              processed: response.documents.filter(doc => doc.status === 'processed'),
+              preprocessed: response.documents.filter(doc => doc.status === 'preprocessed'),
+              processing: response.documents.filter(doc => doc.status === 'processing'),
+              pending: response.documents.filter(doc => doc.status === 'pending'),
+              failed: response.documents.filter(doc => doc.status === 'failed')
+            }
           };
 
-          const lastPageResponse = await withTimeout(
-            getDocumentsPaginated(lastPageRequest),
-            30000,
-            'Document fetch timeout'
-          );
-
-          if (!isMountedRef.current) return;
-
-          // Update page state to last page
-          setPageByStatus(prev => ({ ...prev, [statusFilter]: lastPage }));
-          updateComponentState(lastPageResponse);
-          return;
+          if (response.pagination.total_count > 0) {
+            setDocs(legacyDocs);
+          } else {
+            setDocs(null);
+          }
         }
-      }
+      } else {
+        const { customTimeout } = refreshRequest;
+        const pageToFetch = query.page;
+        const request = buildDocumentsRequest(query, pageToFetch)
+        const response = await getDocumentsPaginatedWithTimeout(request, customTimeout)
 
-      // Normal case: update state
-      if (pageToFetch !== pagination.page) {
-        setPageByStatus(prev => ({ ...prev, [statusFilter]: pageToFetch }));
+        if (!isMountedRef.current || isStaleRequest()) return;
+
+        // Boundary case handling: if target page has no data but total count > 0
+        if (response.documents.length === 0 && response.pagination.total_count > 0) {
+          const lastPage = Math.max(1, response.pagination.total_pages);
+
+          if (pageToFetch !== lastPage) {
+            const lastPageRequest = buildDocumentsRequest(query, lastPage)
+            const lastPageResponse = await getDocumentsPaginatedWithTimeout(
+              lastPageRequest,
+              customTimeout
+            )
+
+            if (!isMountedRef.current || isStaleRequest()) return;
+
+            setPageByStatus(prev => ({ ...prev, [query.statusFilter]: lastPage }));
+            updateComponentState(lastPageResponse);
+            return;
+          }
+        }
+
+        setPageByStatus(prev => (
+          prev[query.statusFilter] === pageToFetch
+            ? prev
+            : { ...prev, [query.statusFilter]: pageToFetch }
+        ));
+        updateComponentState(response);
       }
-      updateComponentState(response);
 
     } catch (err) {
       if (isMountedRef.current) {
@@ -719,20 +810,82 @@ export default function DocumentManager() {
         setIsRefreshing(false);
       }
     }
-  }, [statusFilter, pagination.page, pagination.page_size, sortField, sortDirection, t, updateComponentState, withTimeout, classifyError, recordFailure]);
+  }, [
+    t,
+    updateComponentState,
+    classifyError,
+    recordFailure,
+    handlePageSizeChange,
+    buildDocumentsRequest
+  ]);
+
+  const enqueueRefresh = useCallback(async (refreshRequest: RefreshRequest) => {
+    if (activeRefreshPromiseRef.current) {
+      pendingRefreshRequestRef.current = refreshRequest;
+      await activeRefreshPromiseRef.current;
+      return;
+    }
+
+    const refreshLoopPromise = (async () => {
+      let nextRequest: RefreshRequest | null = refreshRequest;
+
+      while (nextRequest) {
+        pendingRefreshRequestRef.current = null;
+        await runRefreshRequest(nextRequest);
+        nextRequest = pendingRefreshRequestRef.current;
+      }
+    })();
+
+    activeRefreshPromiseRef.current = refreshLoopPromise;
+
+    try {
+      await refreshLoopPromise;
+    } finally {
+      if (activeRefreshPromiseRef.current === refreshLoopPromise) {
+        activeRefreshPromiseRef.current = null;
+      }
+      pendingRefreshRequestRef.current = null;
+    }
+  }, [runRefreshRequest]);
+
+  // Intelligent refresh function: handles all boundary cases
+  const handleIntelligentRefresh = useCallback(async (
+    targetPage?: number,
+    resetToFirst?: boolean,
+    customTimeout?: number
+  ) => {
+    const page = resetToFirst ? 1 : (targetPage || pagination.page)
+    const query = buildQuerySnapshot({ page })
+    const requestVersion = latestRefreshRequestVersionRef.current
+
+    await enqueueRefresh({
+      type: 'intelligent',
+      query,
+      customTimeout,
+      requestVersion
+    });
+  }, [buildQuerySnapshot, enqueueRefresh, pagination.page]);
 
   // New paginated data fetching function
   const fetchPaginatedDocuments = useCallback(async (
     page: number,
     pageSize: number,
-    _statusFilter: StatusFilter // eslint-disable-line @typescript-eslint/no-unused-vars
+    currentStatusFilter: StatusFilter
   ) => {
     // Update pagination state
     setPagination(prev => ({ ...prev, page, page_size: pageSize }));
 
     // Use intelligent refresh
-    await handleIntelligentRefresh(page);
-  }, [handleIntelligentRefresh]);
+    await enqueueRefresh({
+      type: 'intelligent',
+      query: buildQuerySnapshot({
+        page,
+        pageSize,
+        statusFilter: currentStatusFilter
+      }),
+      requestVersion: latestRefreshRequestVersionRef.current
+    });
+  }, [buildQuerySnapshot, enqueueRefresh]);
 
   // Legacy fetchDocuments function for backward compatibility
   const fetchDocuments = useCallback(async () => {
@@ -813,14 +966,17 @@ export default function DocumentManager() {
       // Reset health check timer with 1 second delay to avoid race condition
       useBackendState.getState().resetHealthCheckTimerDelayed(1000);
 
-      // Start fast refresh with 2-second interval immediately after scan
+      // Perform immediate refresh with 90s timeout after scan (tolerates PostgreSQL switchover)
+      await handleIntelligentRefresh(undefined, false, 90000);
+
+      // Start fast refresh with 2-second interval after initial refresh
       startPollingInterval(2000);
 
       // Set recovery timer to restore normal polling interval after 15 seconds
       setTimeout(() => {
         if (isMountedRef.current && currentTab === 'documents' && health) {
           // Restore intelligent polling interval based on document status
-          const hasActiveDocuments = (statusCounts.processing || 0) > 0 || (statusCounts.pending || 0) > 0;
+          const hasActiveDocuments = hasActiveDocumentsStatus(statusCounts);
           const normalInterval = hasActiveDocuments ? 5000 : 30000;
           startPollingInterval(normalInterval);
         }
@@ -831,82 +987,32 @@ export default function DocumentManager() {
         toast.error(t('documentPanel.documentManager.errors.scanFailed', { error: errorMessage(err) }));
       }
     }
-  }, [t, startPollingInterval, currentTab, health, statusCounts])
-
-  // Handle page size change - update state and save to store
-  const handlePageSizeChange = useCallback((newPageSize: number) => {
-    if (newPageSize === pagination.page_size) return;
-
-    // Save the new page size to the store
-    setDocumentsPageSize(newPageSize);
-
-    // Reset all status filters to page 1 when page size changes
-    setPageByStatus({
-      all: 1,
-      processed: 1,
-      processing: 1,
-      pending: 1,
-      failed: 1,
-    });
-
-    setPagination(prev => ({ ...prev, page: 1, page_size: newPageSize }));
-  }, [pagination.page_size, setDocumentsPageSize]);
+  }, [t, startPollingInterval, currentTab, health, statusCounts, handleIntelligentRefresh])
 
   // Handle manual refresh with pagination reset logic
   const handleManualRefresh = useCallback(async () => {
-    try {
-      setIsRefreshing(true);
+    await enqueueRefresh({
+      type: 'manual',
+      query: buildQuerySnapshot(),
+      requestVersion: latestRefreshRequestVersionRef.current
+    });
+  }, [buildQuerySnapshot, enqueueRefresh]);
 
-      // Fetch documents from the first page
-      const request: DocumentsRequest = {
-        status_filter: statusFilter === 'all' ? null : statusFilter,
-        page: 1,
-        page_size: pagination.page_size,
-        sort_field: sortField,
-        sort_direction: sortDirection
-      };
+  useEffect(() => {
+    latestRefreshRequestVersionRef.current += 1
+  }, [pagination.page, pagination.page_size, statusFilter, sortField, sortDirection])
 
-      const response = await getDocumentsPaginated(request);
-
-      if (!isMountedRef.current) return;
-
-      // Check if total count is less than current page size and page size is not already 10
-      if (response.pagination.total_count < pagination.page_size && pagination.page_size !== 10) {
-        // Reset page size to 10 which will trigger a new fetch
-        handlePageSizeChange(10);
-      } else {
-        // Update pagination state
-        setPagination(response.pagination);
-        setCurrentPageDocs(response.documents);
-        setStatusCounts(response.status_counts);
-
-        // Update legacy docs state for backward compatibility
-        const legacyDocs: DocsStatusesResponse = {
-          statuses: {
-            processed: response.documents.filter(doc => doc.status === 'processed'),
-            processing: response.documents.filter(doc => doc.status === 'processing'),
-            pending: response.documents.filter(doc => doc.status === 'pending'),
-            failed: response.documents.filter(doc => doc.status === 'failed')
-          }
-        };
-
-        if (response.pagination.total_count > 0) {
-          setDocs(legacyDocs);
-        } else {
-          setDocs(null);
-        }
-      }
-
-    } catch (err) {
-      if (isMountedRef.current) {
-        toast.error(t('documentPanel.documentManager.errors.loadFailed', { error: errorMessage(err) }));
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setIsRefreshing(false);
-      }
+  // Workspace switch — refetch the document list immediately so the table
+  // reflects the newly-selected workspace's data. Without this, the API
+  // calls go out with the new LIGHTRAG-WORKSPACE header but the UI still
+  // shows the previous workspace's docs until the user does something
+  // else that triggers a refresh.
+  useEffect(() => {
+    if (currentTab === 'documents' && health && isMountedRef.current) {
+      handleIntelligentRefresh()
     }
-  }, [statusFilter, pagination.page_size, sortField, sortDirection, handlePageSizeChange, t]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace])
 
   // Monitor pipelineBusy changes and trigger immediate refresh with timer reset
   useEffect(() => {
@@ -918,14 +1024,21 @@ export default function DocumentManager() {
         handleIntelligentRefresh();
 
         // Reset polling timer after intelligent refresh
-        const hasActiveDocuments = (statusCounts.processing || 0) > 0 || (statusCounts.pending || 0) > 0;
+        const hasActiveDocuments = hasActiveDocumentsStatus(statusCounts);
         const pollingInterval = hasActiveDocuments ? 5000 : 30000;
         startPollingInterval(pollingInterval);
       }
     }
     // Update the previous state
     prevPipelineBusyRef.current = pipelineBusy;
-  }, [pipelineBusy, currentTab, health, handleIntelligentRefresh, statusCounts.processing, statusCounts.pending, startPollingInterval]);
+  }, [
+    pipelineBusy,
+    currentTab,
+    health,
+    handleIntelligentRefresh,
+    statusCounts,
+    startPollingInterval
+  ]);
 
   // Set up intelligent polling with dynamic interval based on document status
   useEffect(() => {
@@ -935,7 +1048,7 @@ export default function DocumentManager() {
     }
 
     // Determine polling interval based on document status
-    const hasActiveDocuments = (statusCounts.processing || 0) > 0 || (statusCounts.pending || 0) > 0;
+    const hasActiveDocuments = hasActiveDocumentsStatus(statusCounts);
     const pollingInterval = hasActiveDocuments ? 5000 : 30000; // 5s if active, 30s if idle
 
     startPollingInterval(pollingInterval);
@@ -952,6 +1065,7 @@ export default function DocumentManager() {
     // Get new status counts
     const newStatusCounts = {
       processed: docs?.statuses?.processed?.length || 0,
+      preprocessed: docs?.statuses?.preprocessed?.length || 0,
       processing: docs?.statuses?.processing?.length || 0,
       pending: docs?.statuses?.pending?.length || 0,
       failed: docs?.statuses?.failed?.length || 0
@@ -1037,25 +1151,45 @@ export default function DocumentManager() {
   }, [clearPollingInterval, setStatusCounts, fetchDocuments, currentTab, health, startPollingInterval])
 
 
-  // Handle showFileName change - switch sort field if currently sorting by first column
-  useEffect(() => {
-    // Only switch if currently sorting by the first column (id or file_path)
+  // Handle showFileName change - switch sort field if currently sorting by first column.
+  // Render-time comparison avoids cascading renders flagged by react-hooks/set-state-in-effect.
+  const [previousShowFileName, setPreviousShowFileName] = useState(showFileName)
+  if (showFileName !== previousShowFileName) {
+    setPreviousShowFileName(showFileName)
     if (sortField === 'id' || sortField === 'file_path') {
       const newSortField = showFileName ? 'file_path' : 'id';
       if (sortField !== newSortField) {
         setSortField(newSortField);
       }
     }
-  }, [showFileName, sortField]);
+  }
 
-  // Reset selection state when page, status filter, or sort changes
-  useEffect(() => {
+  // Reset selection state when page, status filter, or sort changes (render-time comparison).
+  const [previousSelectionDeps, setPreviousSelectionDeps] = useState({
+    page: pagination.page,
+    statusFilter,
+    sortField,
+    sortDirection
+  })
+  if (
+    previousSelectionDeps.page !== pagination.page ||
+    previousSelectionDeps.statusFilter !== statusFilter ||
+    previousSelectionDeps.sortField !== sortField ||
+    previousSelectionDeps.sortDirection !== sortDirection
+  ) {
+    setPreviousSelectionDeps({
+      page: pagination.page,
+      statusFilter,
+      sortField,
+      sortDirection
+    })
     setSelectedDocIds([])
-  }, [pagination.page, statusFilter, sortField, sortDirection]);
+  }
 
-  // Central effect to handle all data fetching
+  // Central effect to handle all data fetching - genuine side effect (network call)
   useEffect(() => {
     if (currentTab === 'documents') {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchPaginatedDocuments(pagination.page, pagination.page_size, statusFilter);
     }
   }, [
@@ -1140,7 +1274,7 @@ export default function DocumentManager() {
             ) : !isSelectionMode ? (
               <ClearDocumentsDialog onDocumentsCleared={handleDocumentsCleared} />
             ) : null}
-            <UploadDocumentsDialog onDocumentsUploaded={fetchDocuments} />
+            <UploadDocumentsDialog onDocumentsUploaded={() => handleIntelligentRefresh(undefined, false, 120000)} />
             <PipelineStatusDialog
               open={showPipelineStatus}
               onOpenChange={setShowPipelineStatus}
@@ -1171,11 +1305,23 @@ export default function DocumentManager() {
                     onClick={() => handleStatusFilterChange('processed')}
                     disabled={isRefreshing}
                     className={cn(
-                      (statusCounts.PROCESSED || statusCounts.processed || documentCounts.processed) > 0 ? 'text-green-600' : 'text-gray-500',
+                      processedCount > 0 ? 'text-green-600' : 'text-gray-500',
                       statusFilter === 'processed' && 'bg-green-100 dark:bg-green-900/30 font-medium border border-green-400 dark:border-green-600 shadow-sm'
                     )}
                   >
-                    {t('documentPanel.documentManager.status.completed')} ({statusCounts.PROCESSED || statusCounts.processed || 0})
+                    {t('documentPanel.documentManager.status.completed')} ({processedCount})
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={statusFilter === 'preprocessed' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('preprocessed')}
+                    disabled={isRefreshing}
+                    className={cn(
+                      preprocessedCount > 0 ? 'text-purple-600' : 'text-gray-500',
+                      statusFilter === 'preprocessed' && 'bg-purple-100 dark:bg-purple-900/30 font-medium border border-purple-400 dark:border-purple-600 shadow-sm'
+                    )}
+                  >
+                    {t('documentPanel.documentManager.status.preprocessed')} ({preprocessedCount})
                   </Button>
                   <Button
                     size="sm"
@@ -1183,11 +1329,11 @@ export default function DocumentManager() {
                     onClick={() => handleStatusFilterChange('processing')}
                     disabled={isRefreshing}
                     className={cn(
-                      (statusCounts.PROCESSING || statusCounts.processing || documentCounts.processing) > 0 ? 'text-blue-600' : 'text-gray-500',
+                      processingCount > 0 ? 'text-blue-600' : 'text-gray-500',
                       statusFilter === 'processing' && 'bg-blue-100 dark:bg-blue-900/30 font-medium border border-blue-400 dark:border-blue-600 shadow-sm'
                     )}
                   >
-                    {t('documentPanel.documentManager.status.processing')} ({statusCounts.PROCESSING || statusCounts.processing || 0})
+                    {t('documentPanel.documentManager.status.processing')} ({processingCount})
                   </Button>
                   <Button
                     size="sm"
@@ -1195,11 +1341,11 @@ export default function DocumentManager() {
                     onClick={() => handleStatusFilterChange('pending')}
                     disabled={isRefreshing}
                     className={cn(
-                      (statusCounts.PENDING || statusCounts.pending || documentCounts.pending) > 0 ? 'text-yellow-600' : 'text-gray-500',
+                      pendingCount > 0 ? 'text-yellow-600' : 'text-gray-500',
                       statusFilter === 'pending' && 'bg-yellow-100 dark:bg-yellow-900/30 font-medium border border-yellow-400 dark:border-yellow-600 shadow-sm'
                     )}
                   >
-                    {t('documentPanel.documentManager.status.pending')} ({statusCounts.PENDING || statusCounts.pending || 0})
+                    {t('documentPanel.documentManager.status.pending')} ({pendingCount})
                   </Button>
                   <Button
                     size="sm"
@@ -1207,11 +1353,11 @@ export default function DocumentManager() {
                     onClick={() => handleStatusFilterChange('failed')}
                     disabled={isRefreshing}
                     className={cn(
-                      (statusCounts.FAILED || statusCounts.failed || documentCounts.failed) > 0 ? 'text-red-600' : 'text-gray-500',
+                      failedCount > 0 ? 'text-red-600' : 'text-gray-500',
                       statusFilter === 'failed' && 'bg-red-100 dark:bg-red-900/30 font-medium border border-red-400 dark:border-red-600 shadow-sm'
                     )}
                   >
-                    {t('documentPanel.documentManager.status.failed')} ({statusCounts.FAILED || statusCounts.failed || 0})
+                    {t('documentPanel.documentManager.status.failed')} ({failedCount})
                   </Button>
                 </div>
                 <Button
@@ -1261,152 +1407,146 @@ export default function DocumentManager() {
             {docs && (
               <div className="absolute inset-0 flex flex-col p-0">
                 <div className="absolute inset-[-1px] flex flex-col p-0 border rounded-md border-gray-200 dark:border-gray-700 overflow-hidden">
-                  <Table className="w-full">
-                    <TableHeader className="sticky top-0 bg-background z-10 shadow-sm">
-                      <TableRow className="border-b bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/75 shadow-[inset_0_-1px_0_rgba(0,0,0,0.1)]">
-                        <TableHead
-                          onClick={() => handleSort('id')}
-                          className="cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 select-none"
-                        >
-                          <div className="flex items-center">
-                            {showFileName
-                              ? t('documentPanel.documentManager.columns.fileName')
-                              : t('documentPanel.documentManager.columns.id')
-                            }
-                            {((sortField === 'id' && !showFileName) || (sortField === 'file_path' && showFileName)) && (
-                              <span className="ml-1">
-                                {sortDirection === 'asc' ? <ArrowUpIcon size={14} /> : <ArrowDownIcon size={14} />}
-                              </span>
-                            )}
-                          </div>
-                        </TableHead>
-                        <TableHead>{t('documentPanel.documentManager.columns.summary')}</TableHead>
-                        <TableHead>{t('documentPanel.documentManager.columns.status')}</TableHead>
-                        <TableHead>{t('documentPanel.documentManager.columns.length')}</TableHead>
-                        <TableHead>{t('documentPanel.documentManager.columns.chunks')}</TableHead>
-                        <TableHead
-                          onClick={() => handleSort('created_at')}
-                          className="cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 select-none"
-                        >
-                          <div className="flex items-center">
-                            {t('documentPanel.documentManager.columns.created')}
-                            {sortField === 'created_at' && (
-                              <span className="ml-1">
-                                {sortDirection === 'asc' ? <ArrowUpIcon size={14} /> : <ArrowDownIcon size={14} />}
-                              </span>
-                            )}
-                          </div>
-                        </TableHead>
-                        <TableHead
-                          onClick={() => handleSort('updated_at')}
-                          className="cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 select-none"
-                        >
-                          <div className="flex items-center">
-                            {t('documentPanel.documentManager.columns.updated')}
-                            {sortField === 'updated_at' && (
-                              <span className="ml-1">
-                                {sortDirection === 'asc' ? <ArrowUpIcon size={14} /> : <ArrowDownIcon size={14} />}
-                              </span>
-                            )}
-                          </div>
-                        </TableHead>
-                        <TableHead className="w-16 text-center">
-                          {t('documentPanel.documentManager.columns.select')}
-                        </TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody className="text-sm overflow-auto">
-                      {filteredAndSortedDocs && filteredAndSortedDocs.map((doc) => (
-                        <TableRow key={doc.id}>
-                          <TableCell className="truncate font-mono overflow-visible max-w-[250px]">
-                            {showFileName ? (
-                              <>
-                                <div className="group relative overflow-visible tooltip-container">
-                                  <div className="truncate">
-                                    {getDisplayFileName(doc, 30)}
-                                  </div>
-                                  <div className="invisible group-hover:visible tooltip">
-                                    {doc.file_path}
-                                  </div>
-                                </div>
-                                <div className="text-xs text-gray-500">{doc.id}</div>
-                              </>
-                            ) : (
-                              <div className="group relative overflow-visible tooltip-container">
-                                <div className="truncate">
-                                  {doc.id}
-                                </div>
-                                <div className="invisible group-hover:visible tooltip">
-                                  {doc.file_path}
-                                </div>
-                              </div>
-                            )}
-                          </TableCell>
-                          <TableCell className="max-w-xs min-w-45 truncate overflow-visible">
-                            <div className="group relative overflow-visible tooltip-container">
-                              <div className="truncate">
-                                {doc.content_summary}
-                              </div>
-                              <div className="invisible group-hover:visible tooltip">
-                                {doc.content_summary}
-                              </div>
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="group relative flex items-center overflow-visible tooltip-container">
-                              {doc.status === 'processed' && (
-                                <span className="text-green-600">{t('documentPanel.documentManager.status.completed')}</span>
-                              )}
-                              {doc.status === 'processing' && (
-                                <span className="text-blue-600">{t('documentPanel.documentManager.status.processing')}</span>
-                              )}
-                              {doc.status === 'pending' && (
-                                <span className="text-yellow-600">{t('documentPanel.documentManager.status.pending')}</span>
-                              )}
-                              {doc.status === 'failed' && (
-                                <span className="text-red-600">{t('documentPanel.documentManager.status.failed')}</span>
-                              )}
-
-                              {/* Icon rendering logic */}
-                              {doc.error_msg ? (
-                                <AlertTriangle className="ml-2 h-4 w-4 text-yellow-500" />
-                              ) : (doc.metadata && Object.keys(doc.metadata).length > 0) && (
-                                <Info className="ml-2 h-4 w-4 text-blue-500" />
-                              )}
-
-                              {/* Tooltip rendering logic */}
-                              {(doc.error_msg || (doc.metadata && Object.keys(doc.metadata).length > 0)) && (
-                                <div className="invisible group-hover:visible tooltip">
-                                  {doc.error_msg && (
-                                    <pre>{doc.error_msg}</pre>
-                                  )}
-                                  {doc.metadata && Object.keys(doc.metadata).length > 0 && (
-                                    <pre>{formatMetadata(doc.metadata)}</pre>
-                                  )}
-                                </div>
+                  <TooltipProvider>
+                    <Table className="w-full">
+                      <TableHeader className="sticky top-0 bg-background z-10 shadow-sm">
+                        <TableRow className="border-b bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/75 shadow-[inset_0_-1px_0_rgba(0,0,0,0.1)]">
+                          <TableHead
+                            onClick={() => handleSort('id')}
+                            className="cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 select-none"
+                          >
+                            <div className="flex items-center">
+                              {showFileName
+                                ? t('documentPanel.documentManager.columns.fileName')
+                                : t('documentPanel.documentManager.columns.id')
+                              }
+                              {((sortField === 'id' && !showFileName) || (sortField === 'file_path' && showFileName)) && (
+                                <span className="ml-1">
+                                  {sortDirection === 'asc' ? <ArrowUpIcon size={14} /> : <ArrowDownIcon size={14} />}
+                                </span>
                               )}
                             </div>
-                          </TableCell>
-                          <TableCell>{doc.content_length ?? '-'}</TableCell>
-                          <TableCell>{doc.chunks_count ?? '-'}</TableCell>
-                          <TableCell className="truncate">
-                            {new Date(doc.created_at).toLocaleString()}
-                          </TableCell>
-                          <TableCell className="truncate">
-                            {new Date(doc.updated_at).toLocaleString()}
-                          </TableCell>
-                          <TableCell className="text-center">
-                            <Checkbox
-                              checked={selectedDocIds.includes(doc.id)}
-                              onCheckedChange={(checked) => handleDocumentSelect(doc.id, checked === true)}
-                              // disabled={doc.status !== 'processed'}
-                              className="mx-auto"
-                            />
-                          </TableCell>
+                          </TableHead>
+                          <TableHead>{t('documentPanel.documentManager.columns.summary')}</TableHead>
+                          <TableHead>{t('documentPanel.documentManager.columns.status')}</TableHead>
+                          <TableHead>{t('documentPanel.documentManager.columns.length')}</TableHead>
+                          <TableHead>{t('documentPanel.documentManager.columns.chunks')}</TableHead>
+                          <TableHead
+                            onClick={() => handleSort('created_at')}
+                            className="cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 select-none"
+                          >
+                            <div className="flex items-center">
+                              {t('documentPanel.documentManager.columns.created')}
+                              {sortField === 'created_at' && (
+                                <span className="ml-1">
+                                  {sortDirection === 'asc' ? <ArrowUpIcon size={14} /> : <ArrowDownIcon size={14} />}
+                                </span>
+                              )}
+                            </div>
+                          </TableHead>
+                          <TableHead
+                            onClick={() => handleSort('updated_at')}
+                            className="cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 select-none"
+                          >
+                            <div className="flex items-center">
+                              {t('documentPanel.documentManager.columns.updated')}
+                              {sortField === 'updated_at' && (
+                                <span className="ml-1">
+                                  {sortDirection === 'asc' ? <ArrowUpIcon size={14} /> : <ArrowDownIcon size={14} />}
+                                </span>
+                              )}
+                            </div>
+                          </TableHead>
+                          <TableHead className="w-16 text-center">
+                            {t('documentPanel.documentManager.columns.select')}
+                          </TableHead>
                         </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
+                      </TableHeader>
+                      <TableBody className="text-sm overflow-auto">
+                        {filteredAndSortedDocs && filteredAndSortedDocs.map((doc) => (
+                          <TableRow key={doc.id}>
+                            <TableCell className="truncate font-mono overflow-visible max-w-[250px]">
+                              {showFileName ? (
+                                <>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <div className="truncate">
+                                        {getDisplayFileName(doc, 30)}
+                                      </div>
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top" className="max-w-2xl">
+                                      {doc.file_path}
+                                    </TooltipContent>
+                                  </Tooltip>
+                                  <div className="text-xs text-gray-500">{doc.id}</div>
+                                </>
+                              ) : (
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <div className="truncate">
+                                      {doc.id}
+                                    </div>
+                                  </TooltipTrigger>
+                                  <TooltipContent side="top" className="max-w-2xl">
+                                    {doc.file_path}
+                                  </TooltipContent>
+                                </Tooltip>
+                              )}
+                            </TableCell>
+                            <TableCell className="max-w-xs min-w-45 truncate overflow-visible">
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <div className="truncate">
+                                    {doc.content_summary}
+                                  </div>
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="max-w-2xl">
+                                  {doc.content_summary}
+                                </TooltipContent>
+                              </Tooltip>
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex items-center">
+                                {doc.status === 'processed' && (
+                                  <span className="text-green-600">{t('documentPanel.documentManager.status.completed')}</span>
+                                )}
+                                {doc.status === 'preprocessed' && (
+                                  <span className="text-purple-600">{t('documentPanel.documentManager.status.preprocessed')}</span>
+                                )}
+                                {doc.status === 'processing' && (
+                                  <span className="text-blue-600">{t('documentPanel.documentManager.status.processing')}</span>
+                                )}
+                                {doc.status === 'pending' && (
+                                  <span className="text-yellow-600">{t('documentPanel.documentManager.status.pending')}</span>
+                                )}
+                                {doc.status === 'failed' && (
+                                  <span className="text-red-600">{t('documentPanel.documentManager.status.failed')}</span>
+                                )}
+
+                                {hasDocumentDetails(doc) && <DocumentStatusDetailsDialog doc={doc} />}
+                              </div>
+                            </TableCell>
+                            <TableCell>{doc.content_length ?? '-'}</TableCell>
+                            <TableCell>{doc.chunks_count ?? '-'}</TableCell>
+                            <TableCell className="truncate">
+                              {new Date(doc.created_at).toLocaleString()}
+                            </TableCell>
+                            <TableCell className="truncate">
+                              {new Date(doc.updated_at).toLocaleString()}
+                            </TableCell>
+                            <TableCell className="text-center">
+                              <Checkbox
+                                checked={selectedDocIds.includes(doc.id)}
+                                onCheckedChange={(checked) => handleDocumentSelect(doc.id, checked === true)}
+                                // disabled={doc.status !== 'processed'}
+                                className="mx-auto"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TooltipProvider>
                 </div>
               </div>
             )}
