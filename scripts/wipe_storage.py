@@ -16,11 +16,14 @@ WHAT THIS SCRIPT PRESERVES IN REDIS
       - `ingestion:*`     application ingestion tracking
       - `schema:*`        application schema cache
       - `arq:*`           async task queue state
-    The backend does not use the `llm_response_cache:*` namespace (grep
-    confirms), and post-workspace-migration LightRAG only ever writes to
-    `<workspace>_llm_response_cache:*` — so any unprefixed
-    `llm_response_cache:*` keys are pre-migration orphans and are deleted
-    along with the workspace-prefixed copies.
+
+EVERY OTHER LIGHTRAG-OWNED KEY IS DELETED
+    LightRAG's Redis namespaces (`doc_status`, `full_docs`, `text_chunks`,
+    `entity_chunks`, `relation_chunks`, `full_entities`, `full_relations`,
+    `llm_response_cache`) are swept under a wildcard prefix
+    (`*_<namespace>:*`), so per-request workspaces like `solution_42` that
+    the script can't enumerate statically still get cleaned. Pre-workspace
+    unprefixed copies (`llm_response_cache:*` etc.) are also deleted.
 
 USAGE
     # Dry run (default — prints what would change, no writes)
@@ -189,11 +192,19 @@ def _scan_keys(redis_client, pattern: str) -> Iterable[str]:
 def wipe_redis(execute: bool, include_all_workspaces: bool) -> str:
     """Delete LightRAG-owned keys, preserving backend state.
 
-    Two sweep modes:
-        - surgical (default): only fixed legacy patterns + the workspace
-          patterns enumerated below
-        - --include-all-workspaces: also matches any key whose suffix is one
-          of LightRAG's known namespaces (handles unknown workspaces)
+    Sweep strategy: every LightRAG-owned Redis key matches one of three
+    pattern groups, all swept unconditionally:
+      1. Fixed legacy unprefixed patterns (pre-workspace LightRAG data).
+      2. Per-workspace patterns for every workspace listed via env
+         (WORKSPACE) + --workspaces. Redundant with (3), kept for clarity.
+      3. Wildcard-prefix patterns (`*_<lightrag_namespace>:*`) catching
+         every workspace the script doesn't know about by name. This is
+         needed under PR #16's per-request workspaces, where
+         solution_<id> instances are created on demand and never appear
+         in any env var.
+
+    --include-all-workspaces used to gate (3); it's now a no-op (kept for
+    backward compatibility with existing automation).
     """
     import redis  # type: ignore
 
@@ -227,20 +238,34 @@ def wipe_redis(execute: bool, include_all_workspaces: bool) -> str:
         ):
             patterns.append(f"{ws}_{ns}:*")
 
-    if include_all_workspaces:
-        # Broad sweep: any key ending in a LightRAG namespace, regardless
-        # of the (unknown) workspace prefix. Suffixes are unique to
-        # LightRAG so collisions with backend keys are unlikely.
-        for ns in (
-            "doc_status",
-            "full_docs",
-            "text_chunks",
-            "entity_chunks",
-            "relation_chunks",
-            "full_entities",
-            "full_relations",
-        ):
-            patterns.append(f"*_{ns}:*")
+    # Always sweep every workspace's LightRAG-owned Redis namespaces by
+    # wildcard prefix. Per-request workspaces (PR #16) mean we cannot
+    # enumerate them statically — solution_<id> workspaces are created on
+    # demand by /documents/upload, so the WORKSPACE env var + --workspaces
+    # flag alone will never know about them all. These suffixes are unique
+    # to LightRAG (the backend reserves prefixes like `ingestion:`,
+    # `schema:`, `arq:`), so the wildcard match is safe.
+    #
+    # `llm_response_cache` was previously missing from this list, which
+    # caused solution_<id> LLM caches to survive every wipe and hand out
+    # stale cache hits during reingest — silently zeroing per-doc token
+    # tracking for any non-default workspace. It's included here so a fresh
+    # wipe truly starts from zero.
+    for ns in (
+        "doc_status",
+        "full_docs",
+        "text_chunks",
+        "entity_chunks",
+        "relation_chunks",
+        "full_entities",
+        "full_relations",
+        "llm_response_cache",
+    ):
+        patterns.append(f"*_{ns}:*")
+
+    # The --include-all-workspaces flag is now a no-op — the broad sweep is
+    # unconditional. Kept for backward compatibility with existing scripts.
+    del include_all_workspaces
 
     if not execute:
         sample = {}
@@ -292,8 +317,8 @@ def main() -> int:
     parser.add_argument(
         "--include-all-workspaces",
         action="store_true",
-        help="Also delete Redis keys for any unknown workspace whose suffix matches "
-        "a LightRAG namespace. Use after multi-workspace deployments.",
+        help="Deprecated no-op; the broad cross-workspace sweep is now "
+        "always on (required for per-request workspaces).",
     )
     parser.add_argument(
         "--env-file",
