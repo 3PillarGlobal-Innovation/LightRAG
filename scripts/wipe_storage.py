@@ -16,10 +16,11 @@ WHAT THIS SCRIPT PRESERVES IN REDIS
       - `ingestion:*`     application ingestion tracking
       - `schema:*`        application schema cache
       - `arq:*`           async task queue state
-      - `llm_response_cache:default:*` (unprefixed) — preserved because it
-        is ambiguous: it could be either LightRAG's pre-workspace cache or
-        a backend cache sharing the same name. Treat as "may be backend's".
-        Workspace-prefixed `<workspace>_llm_response_cache:*` IS deleted.
+    The backend does not use the `llm_response_cache:*` namespace (grep
+    confirms), and post-workspace-migration LightRAG only ever writes to
+    `<workspace>_llm_response_cache:*` — so any unprefixed
+    `llm_response_cache:*` keys are pre-migration orphans and are deleted
+    along with the workspace-prefixed copies.
 
 USAGE
     # Dry run (default — prints what would change, no writes)
@@ -162,6 +163,12 @@ _REDIS_LIGHTRAG_KEY_PATTERNS = (
     "full_relations:*",
     "text_chunks:*",
     "full_docs:doc-*",
+    # The unprefixed LLM cache only exists as a pre-workspace-migration
+    # orphan — current LightRAG always writes under <workspace>_… and the
+    # backend doesn't use this namespace. Pattern uses `:` as separator
+    # so workspace-prefixed keys like `<ws>_llm_response_cache:*` (which
+    # don't start with `llm_response_cache:`) are not matched here.
+    "llm_response_cache:*",
     # Anything LightRAG-prefixed by a workspace name follows the shape
     # `<workspace>_<namespace>:...`. Iterating known workspaces from env keeps
     # this surgical; passing --include-all-workspaces sweeps every key with
