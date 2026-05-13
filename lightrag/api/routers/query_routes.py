@@ -4,7 +4,7 @@ This module contains all query-related routes for the LightRAG API.
 
 import json
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
@@ -188,7 +188,7 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
@@ -196,6 +196,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
     router = APIRouter(tags=["query"])
 
     combined_auth = get_combined_auth_dependency(api_key)
+
+    async def _rag_dep(request: Request):
+        """Resolve the LightRAG instance for this request's workspace."""
+        return await get_rag(request)
 
     @router.post(
         "/query",
@@ -326,7 +330,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, rag=Depends(_rag_dep)):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -536,7 +540,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, rag=Depends(_rag_dep)):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -1039,7 +1043,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(request: QueryRequest, rag=Depends(_rag_dep)):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 

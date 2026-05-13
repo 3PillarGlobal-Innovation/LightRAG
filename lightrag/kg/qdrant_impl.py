@@ -449,7 +449,10 @@ class QdrantVectorDBStorage(BaseVectorStorage):
             # Fallback: use legacy namespace if model_suffix is unavailable
             self.final_namespace = f"lightrag_vdb_{self.namespace}"
             logger.warning(
-                f"Qdrant collection: {self.final_namespace} missing suffix. Pls add model_name to embedding_func for proper workspace data isolation."
+                f"Qdrant collection: {self.final_namespace} missing model suffix. "
+                "Add model_name to embedding_func for embedding-model isolation "
+                "(separate collections per model). Workspace isolation is "
+                "unaffected — it is enforced via the workspace_id payload filter."
             )
 
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
