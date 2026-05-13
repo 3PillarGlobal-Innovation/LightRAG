@@ -1445,9 +1445,17 @@ def create_app(args):
             default_workspace = get_default_workspace()
             if workspace is None:
                 workspace = default_workspace
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=workspace
-            )
+            try:
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=workspace
+                )
+            except Exception:
+                # The requested workspace hasn't been used yet, so its
+                # pipeline_status namespace doesn't exist in shared
+                # storage. Return an empty pipeline_status rather than
+                # 500-ing — /health is meant to be a cheap probe, not
+                # a workspace initializer.
+                pipeline_status = {}
 
             if not auth_configured:
                 auth_mode = "disabled"
@@ -1509,6 +1517,63 @@ def create_app(args):
             }
         except Exception as e:
             logger.error(f"Error getting health status: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/workspaces",
+        dependencies=[Depends(combined_auth)],
+        summary="List known workspaces",
+        description=(
+            "Returns the distinct workspace names that currently have indexed "
+            "documents, plus the document count per workspace. Used by the "
+            "WebUI to populate the workspace selector. Currently only the "
+            "PGDocStatusStorage backend is fully supported; other backends "
+            "return just the registry-known workspaces."
+        ),
+    )
+    async def list_workspaces():
+        """Return [{workspace, doc_count}, ...] for the workspace selector."""
+        result: list[dict] = []
+        try:
+            # Fast path: PGDocStatusStorage exposes the storage's raw query method.
+            doc_status = getattr(rag, "doc_status", None)
+            db = getattr(doc_status, "db", None)
+            if db is not None and hasattr(db, "query"):
+                rows = await db.query(
+                    "SELECT workspace, COUNT(*) AS doc_count "
+                    "FROM lightrag_doc_status "
+                    "GROUP BY workspace "
+                    "ORDER BY workspace",
+                    multirows=True,
+                )
+                for r in rows or []:
+                    name = r.get("workspace") or ""
+                    result.append(
+                        {
+                            "workspace": name,
+                            "doc_count": int(r.get("doc_count") or 0),
+                        }
+                    )
+            else:
+                # Fallback: registry-known workspaces, no counts.
+                registry = getattr(app.state, "workspace_registry", None)
+                seen = set()
+                if registry is not None:
+                    for inst in registry.values():
+                        ws = getattr(inst, "workspace", "") or ""
+                        if ws not in seen:
+                            seen.add(ws)
+                            result.append({"workspace": ws, "doc_count": None})
+
+            # Always include the env-configured default so the UI can offer it
+            # even before anything has been indexed against it.
+            default_ws = (args.workspace or "").strip()
+            if default_ws and not any(r["workspace"] == default_ws for r in result):
+                result.append({"workspace": default_ws, "doc_count": 0})
+
+            return {"workspaces": result}
+        except Exception as e:
+            logger.error(f"Error listing workspaces: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
     # Pre-render the runtime-config <script> once. The browser-visible URL
