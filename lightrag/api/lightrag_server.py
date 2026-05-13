@@ -231,7 +231,7 @@ class DocumentManagerRegistry:
     Path.mkdir — so no async lock is needed; a plain dict suffices.
     """
 
-    def __init__(self, input_dir: str, default_workspace: Optional[str] = None):
+    def __init__(self, input_dir: str, default_workspace: str | None = None):
         self._input_dir = input_dir
         self._default_workspace = default_workspace or ""
         self._instances: dict[str, "DocumentManager"] = {}
