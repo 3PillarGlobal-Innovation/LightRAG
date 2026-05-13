@@ -4,7 +4,6 @@ import weakref
 import sys
 
 import asyncio
-import contextvars
 import html
 import csv
 import inspect
@@ -538,15 +537,9 @@ class EmbeddingFunc:
                 kwargs["max_token_size"] = self.max_token_size
 
         # Pass token_tracker through so the underlying provider records usage.
-        # Resolution order: kwargs (caller-supplied) > current_embedding_tracker
-        # contextvar (per-doc, set by process_document) > self.token_tracker
-        # (instance-level legacy fallback).
-        if "token_tracker" not in kwargs:
-            ctx_tracker = current_embedding_tracker.get(None)
-            if ctx_tracker is not None:
-                kwargs["token_tracker"] = ctx_tracker
-            elif self.token_tracker is not None:
-                kwargs["token_tracker"] = self.token_tracker
+        # Caller-supplied trackers take precedence over the wrapper-level one.
+        if self.token_tracker is not None and "token_tracker" not in kwargs:
+            kwargs["token_tracker"] = self.token_tracker
 
         # Call the actual embedding function
         result = await self.func(*args, **kwargs)
@@ -2088,13 +2081,6 @@ async def use_llm_func_with_cache(
             - For cache hits: (content, cache_create_time)
             - For cache misses: (content, current_timestamp)
     """
-    # If the caller didn't pass an explicit token_tracker, fall back to the
-    # per-async-task contextvar set by process_document(). This is what
-    # makes per-doc LLM-usage attribution work under MAX_PARALLEL_INSERT > 1
-    # without anyone having to thread the tracker through the call site.
-    if token_tracker is None:
-        token_tracker = current_llm_tracker.get(None)
-
     # Sanitize input text to prevent UTF-8 encoding errors for all LLM providers
     safe_user_prompt = sanitize_text_for_encoding(user_prompt)
     safe_system_prompt = (
@@ -2639,24 +2625,6 @@ async def pick_by_vector_similarity(
         # Fallback to simple truncation
         logger.debug("[VECTOR_SIMILARITY] Falling back to simple truncation")
         return all_chunk_ids[:num_of_chunks]
-
-
-# Per-async-task token-tracker contextvars. process_document() binds these
-# to a per-doc TokenTracker via .set() at the start of each doc; downstream
-# LLM (use_llm_func_with_cache) and embedding (EmbeddingFunc.__call__)
-# callers fall back to these when no explicit tracker is passed.
-#
-# asyncio.create_task() snapshots the current context, so two docs running
-# in parallel each get their own copy — no shared mutation, no race. This
-# replaces the prior pattern of mutating `self.llm_model_func` and
-# `embedding_inner.token_tracker` at the LightRAG instance level, which
-# could not survive MAX_PARALLEL_INSERT > 1.
-current_llm_tracker: contextvars.ContextVar["TokenTracker | None"] = (
-    contextvars.ContextVar("current_llm_tracker", default=None)
-)
-current_embedding_tracker: contextvars.ContextVar["TokenTracker | None"] = (
-    contextvars.ContextVar("current_embedding_tracker", default=None)
-)
 
 
 class TokenTracker:

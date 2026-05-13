@@ -99,8 +99,6 @@ from lightrag.utils import (
     TiktokenTokenizer,
     EmbeddingFunc,
     TokenTracker,
-    current_llm_tracker,
-    current_embedding_tracker,
     always_get_an_event_loop,
     compute_mdhash_id,
     lazy_external_import,
@@ -1903,23 +1901,32 @@ class LightRAG:
                     # embedding usage spent indexing this one document so the
                     # cost can be attributed downstream.
                     #
-                    # Trackers are bound to per-async-task contextvars
-                    # (see lightrag.utils.current_llm_tracker /
-                    # current_embedding_tracker). asyncio.create_task() copies
-                    # the current context when each doc task is created, so
-                    # two parallel docs each get their own value — no shared
-                    # mutation of `self.llm_model_func` or
-                    # `embedding_inner.token_tracker` is required, and the
-                    # MAX_PARALLEL_INSERT > 1 race that used to corrupt
-                    # per-doc attribution is gone.
+                    # IMPORTANT: we wrap llm_model_func with a *closure*, not
+                    # functools.partial. extract_entities reads the func via
+                    # `global_config = asdict(self)`, and `asdict` deep-copies
+                    # non-dataclass values — which would clone the partial's
+                    # `keywords` dict (including the TokenTracker), sending the
+                    # actual usage updates into a clone instead of our tracker.
+                    # Closures are deepcopy-immortal in Python, so the
+                    # `doc_llm_tracker` reference inside the closure survives.
+                    #
+                    # CAVEAT: with max_parallel_insert > 1, multiple docs share
+                    # these mutable hooks — recorded per-doc usage is
+                    # approximate (totals are correct, per-doc attribution is
+                    # fuzzy). Set MAX_PARALLEL_INSERT=1 for exact accounting.
                     doc_llm_tracker = TokenTracker()
                     doc_embedding_tracker = TokenTracker()
-                    current_llm_tracker.set(doc_llm_tracker)
-                    current_embedding_tracker.set(doc_embedding_tracker)
+                    original_llm_model_func = self.llm_model_func
 
+                    async def _llm_with_tracker(*args, **kwargs):
+                        kwargs.setdefault("token_tracker", doc_llm_tracker)
+                        return await original_llm_model_func(*args, **kwargs)
+
+                    self.llm_model_func = _llm_with_tracker
                     embedding_inner = getattr(
                         self.embedding_func, "__wrapped__", self.embedding_func
                     )
+                    embedding_inner.token_tracker = doc_embedding_tracker
 
                     def _doc_token_usage_metadata() -> dict[str, Any]:
                         return {
@@ -2296,12 +2303,14 @@ class LightRAG:
                                     }
                                 )
 
-                    # No teardown needed: the per-doc trackers live in
-                    # asyncio-task-scoped contextvars (see lightrag.utils),
-                    # which evaporate when this task's coroutine returns.
-                    # Neither self.llm_model_func nor
-                    # embedding_inner.token_tracker were mutated, so there's
-                    # nothing to restore.
+                    # Restore the original llm_model_func and clear the embedding
+                    # tracker now that this document is done. Done at the end of
+                    # process_document so the trackers don't leak across docs.
+                    # (The inner try/except blocks handle all expected failures,
+                    # so this point is reached on both success and handled
+                    # failure paths.)
+                    self.llm_model_func = original_llm_model_func
+                    embedding_inner.token_tracker = None
 
                 # Create processing tasks for all documents
                 doc_tasks = []
@@ -2972,11 +2981,7 @@ class LightRAG:
             param = replace(param, model_func=partial(param.model_func, token_tracker=llm_tracker))
 
         embedding_inner = getattr(self.embedding_func, "__wrapped__", self.embedding_func)
-        # Bind the per-request embedding tracker to the contextvar instead of
-        # mutating the shared EmbeddingFunc wrapper. Concurrent queries each
-        # get their own snapshot because asyncio tasks copy the context on
-        # creation, so parallel calls don't clobber each other.
-        current_embedding_tracker.set(embedding_tracker)
+        embedding_inner.token_tracker = embedding_tracker
 
         def _build_token_usage_block() -> dict[str, Any]:
             return {
@@ -3105,11 +3110,9 @@ class LightRAG:
                 **_build_token_usage_block(),
             }
         finally:
-            # No teardown needed: the per-request embedding tracker is held
-            # by the current_embedding_tracker contextvar and evaporates with
-            # this task's context. The shared EmbeddingFunc wrapper is never
-            # mutated by this call site.
-            pass
+            # Detach the embedding tracker so future requests don't accidentally
+            # share usage state through the shared EmbeddingFunc wrapper.
+            embedding_inner.token_tracker = None
 
     def query_llm(
         self,
