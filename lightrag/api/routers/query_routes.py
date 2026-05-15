@@ -784,11 +784,6 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                         enriched_references.append(ref_copy)
                     references = enriched_references
 
-                token_usage = _build_token_usage_response(result)
-                token_usage_dump = (
-                    token_usage.model_dump(exclude_none=True) if token_usage else None
-                )
-
                 if llm_response.get("is_streaming"):
                     # Streaming mode: send references first, then stream response chunks
                     if request.include_references:
@@ -804,15 +799,40 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                             logger.error(f"Streaming error: {str(e)}")
                             yield f"{json.dumps({'error': str(e)})}\n"
 
+                    # Re-snapshot token usage AFTER the stream completes.
+                    # Streaming LLM providers only call ``llm_tracker.add(...)``
+                    # once the stream ends, so the pre-stream snapshot in
+                    # ``result`` carries only the embedding call. The
+                    # ``_refresh_token_usage`` callable was attached by
+                    # ``aquery_llm`` exactly for this purpose; it re-reads
+                    # the same trackers and now sees the LLM call_count
+                    # populated.
+                    refresh_token_usage = result.get("_refresh_token_usage")
+                    if callable(refresh_token_usage):
+                        result.update(refresh_token_usage())
+                    token_usage = _build_token_usage_response(result)
+                    token_usage_dump = (
+                        token_usage.model_dump(exclude_none=True) if token_usage else None
+                    )
+
                     # Emit token usage as the final NDJSON frame so streaming
                     # clients can record cost without re-querying.
                     if token_usage_dump is not None:
                         yield f"{json.dumps({'token_usage': token_usage_dump})}\n"
                 else:
-                    # Non-streaming mode: send complete response in one message
+                    # Non-streaming mode: send complete response in one message.
+                    # The LLM call has already completed by the time aquery_llm
+                    # returned, so the snapshot in ``result`` already reflects
+                    # the full LLM usage and we can build the response model
+                    # directly.
                     response_content = llm_response.get("content", "")
                     if not response_content:
                         response_content = "No relevant context found for the query."
+
+                    token_usage = _build_token_usage_response(result)
+                    token_usage_dump = (
+                        token_usage.model_dump(exclude_none=True) if token_usage else None
+                    )
 
                     # Create complete response object
                     complete_response = {"response": response_content}

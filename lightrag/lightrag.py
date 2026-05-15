@@ -3086,6 +3086,13 @@ class LightRAG:
                 "is_streaming": query_result.is_streaming,
             }
             raw_data.update(_build_token_usage_block())
+            # Stream consumers should call this AFTER they finish iterating
+            # ``response_iterator``. Streaming LLM providers only call
+            # ``llm_tracker.add(...)`` when the stream completes, so the
+            # snapshot above carries only embedding usage (recorded during
+            # retrieval). Re-snapshotting after the stream picks up the LLM
+            # call_count + prompt/completion tokens that arrive later.
+            raw_data["_refresh_token_usage"] = _build_token_usage_block
 
             return raw_data
 

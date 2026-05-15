@@ -332,6 +332,19 @@ async def openai_complete_if_cache(
     if timeout is not None:
         kwargs["timeout"] = timeout
 
+    # Ask OpenAI/Azure to include token usage in the final streaming chunk.
+    # Without ``stream_options={"include_usage": True}`` no chunk carries a
+    # ``usage`` attribute, so ``token_tracker.add_usage`` further down never
+    # fires and every streaming query reports zero LLM tokens. Preserve a
+    # caller-supplied ``stream_options`` if one is passed — merge rather
+    # than overwrite so callers can layer additional flags later.
+    if kwargs.get("stream"):
+        existing = kwargs.get("stream_options") or {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing.setdefault("include_usage", True)
+        kwargs["stream_options"] = existing
+
     # Determine the correct model identifier to use
     # For Azure OpenAI, we must use the deployment name instead of the model name
     api_model = azure_deployment if use_azure and azure_deployment else model
