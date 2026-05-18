@@ -23,17 +23,20 @@ export type EdgeType = { label: string }
 const useRandomGraph = () => {
   const [faker, setFaker] = useState<Faker>(fak)
 
+  // Seed global Math.random after commit to avoid polluting the RNG
+  // during render (StrictMode double-invoke, Concurrent Mode aborts)
   useEffect(() => {
-    // Globally seed the Math.random
     const params = new URLSearchParams(document.location.search)
-    const seed = params.get('seed') // is the string "Jonathan"
-    if (seed) {
-      seedrandom(seed, { global: true })
-      // seed faker with the random function
-      const f = new Faker({ locale: en })
-      f.seed(Math.random())
-      setFaker(f)
-    }
+    const seed = params.get('seed')
+    if (!seed) return
+
+    // Global side effect — intentionally in effect, not render
+    seedrandom(seed, { global: true })
+    const f = new Faker({ locale: en })
+    f.seed(Math.random())
+
+    const timer = setTimeout(() => setFaker(f), 0)
+    return () => clearTimeout(timer)
   }, [])
 
   const randomGraph = useCallback(() => {
@@ -56,6 +59,16 @@ const useRandomGraph = () => {
         image: faker.image.urlLoremFlickr()
       })
     })
+
+    // Add edge attributes
+    graph.edges().forEach((edge: string) => {
+      graph.mergeEdgeAttributes(edge, {
+        label: faker.lorem.words(faker.number.int({ min: 1, max: 3 })),
+        size: faker.number.float({ min: 1, max: 5 }),
+        color: randomColor()
+      })
+    })
+
     return graph as Graph<NodeType, EdgeType>
   }, [faker])
 

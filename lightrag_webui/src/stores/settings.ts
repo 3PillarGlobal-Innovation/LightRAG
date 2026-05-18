@@ -5,7 +5,7 @@ import { defaultQueryLabel } from '@/lib/constants'
 import { Message, QueryRequest } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
-type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW'
+type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
 type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api'
 
 interface SettingsState {
@@ -66,6 +66,13 @@ interface SettingsState {
   apiKey: string | null
   setApiKey: (key: string | null) => void
 
+  // Workspace selection — sent as the LIGHTRAG-WORKSPACE header on every API
+  // request. Empty string falls through to the server's args.workspace
+  // (e.g. WORKSPACE=platform_docs). Use values like "platform_docs" or
+  // "solution_42" to view those workspaces' data.
+  workspace: string
+  setWorkspace: (workspace: string) => void
+
   // App settings
   theme: Theme
   setTheme: (theme: Theme) => void
@@ -78,6 +85,10 @@ interface SettingsState {
 
   currentTab: Tab
   setCurrentTab: (tab: Tab) => void
+
+  // Search label dropdown refresh trigger (non-persistent, runtime only)
+  searchLabelDropdownRefreshTrigger: number
+  triggerSearchLabelDropdownRefresh: () => void
 }
 
 const useSettingsStoreBase = create<SettingsState>()(
@@ -110,6 +121,8 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       apiKey: null,
 
+      workspace: '',
+
       currentTab: 'documents',
       showFileName: false,
       documentsPageSize: 10,
@@ -119,7 +132,6 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       querySettings: {
         mode: 'global',
-        response_type: 'Multiple Paragraphs',
         top_k: 40,
         chunk_top_k: 20,
         max_entity_tokens: 6000,
@@ -137,12 +149,6 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setLanguage: (language: Language) => {
         set({ language })
-        // Update i18n after state is updated
-        import('i18next').then(({ default: i18n }) => {
-          if (i18n.language !== language) {
-            i18n.changeLanguage(language)
-          }
-        })
       },
 
       setGraphLayoutMaxIterations: (iterations: number) =>
@@ -187,6 +193,8 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setApiKey: (apiKey: string | null) => set({ apiKey }),
 
+      setWorkspace: (workspace: string) => set({ workspace: workspace.trim() }),
+
       setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
 
       setRetrievalHistory: (history: Message[]) => set({ retrievalHistory: history }),
@@ -229,12 +237,19 @@ const useSettingsStoreBase = create<SettingsState>()(
         })
       },
 
-      setUserPromptHistory: (history: string[]) => set({ userPromptHistory: history })
+      setUserPromptHistory: (history: string[]) => set({ userPromptHistory: history }),
+
+      // Search label dropdown refresh trigger (not persisted)
+      searchLabelDropdownRefreshTrigger: 0,
+      triggerSearchLabelDropdownRefresh: () =>
+        set((state) => ({
+          searchLabelDropdownRefreshTrigger: state.searchLabelDropdownRefreshTrigger + 1
+        }))
     }),
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 18,
+      version: 19,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -330,6 +345,12 @@ const useSettingsStoreBase = create<SettingsState>()(
         if (version < 18) {
           // Add userPromptHistory field for older versions
           state.userPromptHistory = []
+        }
+        if (version < 19) {
+          // Remove deprecated response_type parameter
+          if (state.querySettings) {
+            delete state.querySettings.response_type
+          }
         }
         return state
       }

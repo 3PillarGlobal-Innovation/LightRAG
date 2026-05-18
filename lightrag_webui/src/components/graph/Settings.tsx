@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect} from 'react'
+import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/Popover'
 import Checkbox from '@/components/ui/Checkbox'
 import Button from '@/components/ui/Button'
@@ -7,8 +7,10 @@ import Input from '@/components/ui/Input'
 
 import { controlButtonVariant } from '@/lib/constants'
 import { useSettingsStore } from '@/stores/settings'
+import { useGraphStore } from '@/stores/graph'
+import useRandomGraph from '@/hooks/useRandomGraph'
 
-import { SettingsIcon, Undo2 } from 'lucide-react'
+import { SettingsIcon, Undo2, Shuffle } from 'lucide-react'
 import { useTranslation } from 'react-i18next';
 
 /**
@@ -62,9 +64,33 @@ const LabeledNumberInput = ({
   // Create unique ID using the label text converted to lowercase with spaces removed
   const id = `input-${label.toLowerCase().replace(/\s+/g, '-')}`;
 
-  useEffect(() => {
+  // Keep refs in sync so the unmount effect can read the latest values
+  const currentValueRef = useRef(currentValue)
+  const valueRef = useRef(value)
+  const onEditFinishedRef = useRef(onEditFinished)
+  useLayoutEffect(() => {
+    currentValueRef.current = currentValue
+    valueRef.current = value
+    onEditFinishedRef.current = onEditFinished
+  })
+
+  // Sync local state when controlled value changes (render-time comparison
+  // avoids cascading renders flagged by react-hooks/set-state-in-effect).
+  const [previousValue, setPreviousValue] = useState(value)
+  if (value !== previousValue) {
+    setPreviousValue(value)
     setCurrentValue(value)
-  }, [value])
+  }
+
+  // Commit any pending change when the component unmounts (e.g. popover closes)
+  useEffect(() => {
+    return () => {
+      const cur = currentValueRef.current
+      if (cur !== null && cur !== valueRef.current) {
+        onEditFinishedRef.current(cur)
+      }
+    }
+  }, [])
 
   const onValueChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -163,6 +189,9 @@ export default function Settings() {
 
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
 
+  // Random graph functionality for development/testing
+  const { randomGraph } = useRandomGraph()
+
   const setEnableNodeDrag = useCallback(
     () => useSettingsStore.setState((pre) => ({ enableNodeDrag: !pre.enableNodeDrag })),
     []
@@ -210,11 +239,7 @@ export default function Settings() {
   const setGraphQueryMaxDepth = useCallback((depth: number) => {
     if (depth < 1) return
     useSettingsStore.setState({ graphQueryMaxDepth: depth })
-    const currentLabel = useSettingsStore.getState().queryLabel
-    useSettingsStore.getState().setQueryLabel('')
-    setTimeout(() => {
-      useSettingsStore.getState().setQueryLabel(currentLabel)
-    }, 300)
+    useGraphStore.getState().setGraphDataFetchAttempted(false)
   }, [])
 
   const setGraphMaxNodes = useCallback((nodes: number) => {
@@ -227,6 +252,11 @@ export default function Settings() {
     if (iterations < 1) return
     useSettingsStore.setState({ graphLayoutMaxIterations: iterations })
   }, [])
+
+  const handleGenerateRandomGraph = useCallback(() => {
+    const graph = randomGraph()
+    useGraphStore.getState().setSigmaGraph(graph)
+  }, [randomGraph])
 
   const { t } = useTranslation();
 
@@ -376,7 +406,29 @@ export default function Settings() {
               defaultValue={15}
               onEditFinished={setGraphLayoutMaxIterations}
             />
-            <Separator />
+            {/* Development/Testing Section - Only visible in development mode */}
+            {import.meta.env.DEV && (
+              <>
+                <Separator />
+
+                <div className="flex flex-col gap-2">
+                  <label className="text-sm leading-none font-medium text-muted-foreground">
+                    Dev Options
+                  </label>
+                  <Button
+                    onClick={handleGenerateRandomGraph}
+                    variant="outline"
+                    size="sm"
+                    className="flex items-center gap-2"
+                  >
+                    <Shuffle className="h-3.5 w-3.5" />
+                    Gen Random Graph
+                  </Button>
+                </div>
+
+                <Separator />
+              </>
+            )}
             <Button
               onClick={saveSettings}
               variant="outline"
