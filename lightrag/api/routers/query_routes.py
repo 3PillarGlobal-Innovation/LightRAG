@@ -2,18 +2,34 @@
 This module contains all query-related routes for the LightRAG API.
 """
 
+import asyncio
 import json
+import time
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from lightrag.base import QueryParam
-from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.input_limits import count_conversation_input_chars
+from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
+from lightrag.constants import (
+    MAX_KEYWORD_CHARS,
+    MAX_KEYWORDS_PER_LIST,
+    MAX_MESSAGE_CHARS,
+    MAX_MESSAGES_PER_REQUEST,
+    MAX_QUERY_CHARS,
+    MAX_QUERY_TOKEN_BUDGET,
+    MAX_QUERY_TOP_K,
+    MAX_REQUEST_TEXT_CHARS,
+    MAX_RESPONSE_TYPE_CHARS,
+    MAX_ROLE_CHARS,
+)
 from lightrag.utils import logger
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class QueryRequest(BaseModel):
     query: str = Field(
         min_length=3,
+        max_length=MAX_QUERY_CHARS,
         description="The query text",
     )
 
@@ -34,18 +50,21 @@ class QueryRequest(BaseModel):
 
     response_type: Optional[str] = Field(
         min_length=1,
+        max_length=MAX_RESPONSE_TYPE_CHARS,
         default=None,
         description="Defines the response format. Examples: 'Multiple Paragraphs', 'Single Paragraph', 'Bullet Points'.",
     )
 
     top_k: Optional[int] = Field(
         ge=1,
+        le=MAX_QUERY_TOP_K,
         default=None,
         description="Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode.",
     )
 
     chunk_top_k: Optional[int] = Field(
         ge=1,
+        le=MAX_QUERY_TOP_K,
         default=None,
         description="Number of text chunks to retrieve initially from vector search and keep after reranking.",
     )
@@ -54,27 +73,32 @@ class QueryRequest(BaseModel):
         default=None,
         description="Maximum number of tokens allocated for entity context in unified token control system.",
         ge=1,
+        le=MAX_QUERY_TOKEN_BUDGET,
     )
 
     max_relation_tokens: Optional[int] = Field(
         default=None,
         description="Maximum number of tokens allocated for relationship context in unified token control system.",
         ge=1,
+        le=MAX_QUERY_TOKEN_BUDGET,
     )
 
     max_total_tokens: Optional[int] = Field(
         default=None,
         description="Maximum total tokens budget for the entire query context (entities + relations + chunks + system prompt).",
         ge=1,
+        le=MAX_QUERY_TOKEN_BUDGET,
     )
 
     hl_keywords: list[str] = Field(
         default_factory=list,
+        max_length=MAX_KEYWORDS_PER_LIST,
         description="List of high-level keywords to prioritize in retrieval. Leave empty to use the LLM to generate the keywords.",
     )
 
     ll_keywords: list[str] = Field(
         default_factory=list,
+        max_length=MAX_KEYWORDS_PER_LIST,
         description="List of low-level keywords to refine retrieval focus. Leave empty to use the LLM to generate the keywords.",
     )
 
@@ -85,6 +109,7 @@ class QueryRequest(BaseModel):
 
     user_prompt: Optional[str] = Field(
         default=None,
+        max_length=MAX_QUERY_CHARS,
         description="User-provided prompt for the query. If provided, this will be used instead of the default value from prompt template.",
     )
 
@@ -103,15 +128,39 @@ class QueryRequest(BaseModel):
         description="If True, includes actual chunk text content in references. Only applies when include_references=True. Useful for evaluation and debugging.",
     )
 
+    include_progress: Optional[bool] = Field(
+        default=False,
+        description="If True, emits retrieval pipeline progress events (e.g. "
+        "'extracting_keywords') before the response chunks and appends a final "
+        "response_time metadata line. "
+        "Only applies to /query/stream. When False (default), the stream "
+        "preserves the original protocol order: references first, then "
+        "response chunks — ensuring backward compatibility for existing clients.",
+    )
+
     stream: Optional[bool] = Field(
-        default=True,
-        description="If True, enables streaming output for real-time responses. Only affects /query/stream endpoint.",
+        default=None,
+        description="If True, enables streaming output. Defaults to False for /query, True for /query/stream.",
     )
 
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:
-        return query.strip()
+        # min_length runs before strip; re-check so pads cannot shrink below 3 chars.
+        stripped = query.strip()
+        if len(stripped) < 3:
+            raise ValueError("query must be at least 3 characters after stripping")
+        return stripped
+
+    @field_validator("hl_keywords", "ll_keywords", mode="after")
+    @classmethod
+    def keywords_length_check(cls, keywords: list[str]) -> list[str]:
+        for keyword in keywords:
+            if len(keyword) > MAX_KEYWORD_CHARS:
+                raise ValueError(
+                    f"each keyword must be at most {MAX_KEYWORD_CHARS} characters"
+                )
+        return keywords
 
     @field_validator("conversation_history", mode="after")
     @classmethod
@@ -120,19 +169,62 @@ class QueryRequest(BaseModel):
     ) -> List[Dict[str, Any]] | None:
         if conversation_history is None:
             return None
+        if len(conversation_history) > MAX_MESSAGES_PER_REQUEST:
+            raise ValueError(
+                f"conversation_history must hold at most {MAX_MESSAGES_PER_REQUEST} messages"
+            )
         for msg in conversation_history:
             if "role" not in msg:
                 raise ValueError("Each message must have a 'role' key.")
             if not isinstance(msg["role"], str) or not msg["role"].strip():
                 raise ValueError("Each message 'role' must be a non-empty string.")
+            if len(msg["role"]) > MAX_ROLE_CHARS:
+                raise ValueError(
+                    f"Each message 'role' must be at most {MAX_ROLE_CHARS} characters."
+                )
+            if "content" not in msg:
+                raise ValueError("Each message must have a 'content' key.")
+            if not isinstance(msg["content"], str):
+                raise ValueError("Each message 'content' must be a string.")
+            if len(msg["content"]) > MAX_MESSAGE_CHARS:
+                raise ValueError(
+                    f"Each message 'content' must be at most {MAX_MESSAGE_CHARS} characters."
+                )
+
+        # Extra keys stay allowed on purpose — clients following the OpenAI
+        # convention send 'name' or 'tool_call_id'. The aggregate validator
+        # counts the serialized whole, so those fields consume request budget
+        # without being forbidden outright.
         return conversation_history
+
+    @model_validator(mode="after")
+    def bound_aggregate_text(self) -> "QueryRequest":
+        """Bound all model-facing request input in one request.
+
+        Per-field limits are not a bound on their own: the same payload is
+        trivially rebuilt out of fields that are each individually legal. Every
+        history dict is forwarded verbatim, so count its serialized form rather
+        than only the ``content`` key.
+        """
+        total = count_conversation_input_chars(
+            self.query,
+            self.user_prompt,
+            self.conversation_history,
+        )
+        if total > MAX_REQUEST_TEXT_CHARS:
+            raise ValueError(
+                f"total request text is {total} characters, over the "
+                f"{MAX_REQUEST_TEXT_CHARS} character limit"
+            )
+        return self
 
     def to_query_params(self, is_stream: bool) -> "QueryParam":
         """Converts a QueryRequest instance into a QueryParam instance."""
         # Use Pydantic's `.model_dump(exclude_none=True)` to remove None values automatically
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
-            exclude_none=True, exclude={"query", "include_chunk_content"}
+            exclude_none=True,
+            exclude={"query", "include_chunk_content", "include_progress"},
         )
 
         # Ensure `mode` and `stream` are set explicitly
@@ -229,6 +321,10 @@ class QueryResponse(BaseModel):
         default=None,
         description="LLM + embedding token usage for cost calculation. None when tracking is unavailable for the request.",
     )
+    response_time: Optional[float] = Field(
+        default=None,
+        description="Total server-side processing time in seconds (retrieval + LLM generation)",
+    )
 
 
 class QueryDataResponse(BaseModel):
@@ -243,7 +339,21 @@ class QueryDataResponse(BaseModel):
 
 
 class StreamChunkResponse(BaseModel):
-    """Response model for streaming chunks in NDJSON format"""
+    """Response model for streaming chunks in NDJSON format.
+
+    Default stream order (``include_progress=False``):
+    1. ``references`` — the reference list (only when
+       ``include_references=True``), emitted once as the **first** line.
+    2. ``response`` — LLM response content chunks (streaming) or the
+       complete response (non-streaming).
+    3. ``error`` — error message if processing fails.
+
+    When the client opts in via ``include_progress=True``:
+    ``progress`` lines are emitted **before** ``references``, so clients
+    that depend on ``references`` being the first line should not enable
+    ``include_progress``. A final ``response_time`` metadata line is also
+    emitted after the response completes.
+    """
 
     references: Optional[List[Dict[str, str]]] = Field(
         default=None,
@@ -254,6 +364,14 @@ class StreamChunkResponse(BaseModel):
     )
     error: Optional[str] = Field(
         default=None, description="Error message if processing fails"
+    )
+    progress: Optional[str] = Field(
+        default=None,
+        description="Retrieval pipeline step identifier (e.g. 'extracting_keywords'); only emitted when include_progress=True",
+    )
+    response_time: Optional[float] = Field(
+        default=None,
+        description="Total server-side processing time in seconds (final metadata line when include_progress=True)",
     )
 
 
@@ -403,9 +521,6 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
-        This endpoint performs Retrieval-Augmented Generation (RAG) queries using various modes
-        to provide intelligent responses based on your knowledge base.
-
         **Query Modes:**
         - **local**: Focuses on specific entities and their direct relationships
         - **global**: Analyzes broader patterns and relationships across the knowledge graph
@@ -484,9 +599,10 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
-
             # Unified approach: always use aquery_llm for both cases
+            start_time = time.perf_counter()
             result = await rag.aquery_llm(request.query, param=param)
+            response_time = round(time.perf_counter() - start_time, 3)
 
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
@@ -528,16 +644,120 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                     response=response_content,
                     references=references,
                     token_usage=token_usage,
+                    response_time=response_time,
                 )
             else:
                 return QueryResponse(
                     response=response_content,
                     references=None,
                     token_usage=token_usage,
+                    response_time=response_time,
                 )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
+
+    def _build_stream_generator(
+        *,
+        result: dict[str, Any],
+        include_references: bool,
+        include_chunk_content: bool,
+        include_response_time: bool,
+        start_time: float,
+    ):
+        """Shared async generator that yields NDJSON lines for streaming responses.
+
+        Used by ``/query/stream`` to format NDJSON output with consistent
+        error-handling behaviour. When ``include_response_time`` is enabled,
+        a final metadata line is emitted after all content so opted-in clients
+        can display the total server-side processing duration.
+        """
+
+        async def _generate():
+            references = result.get("data", {}).get("references", [])
+            llm_response = result.get("llm_response", {})
+
+            # Enrich references with chunk content if requested
+            if include_references and include_chunk_content:
+                data = result.get("data", {})
+                chunks = data.get("chunks", [])
+                ref_id_to_content: dict[str, list[str]] = {}
+                for chunk in chunks:
+                    ref_id = chunk.get("reference_id", "")
+                    content = chunk.get("content", "")
+                    if ref_id and content:
+                        ref_id_to_content.setdefault(ref_id, []).append(content)
+
+                enriched_references = []
+                for ref in references:
+                    ref_copy = ref.copy()
+                    ref_id = ref.get("reference_id", "")
+                    if ref_id in ref_id_to_content:
+                        ref_copy["content"] = ref_id_to_content[ref_id]
+                    enriched_references.append(ref_copy)
+                references = enriched_references
+
+            if llm_response.get("is_streaming"):
+                # Streaming: references first, then response chunks
+                if include_references:
+                    yield f"{json.dumps({'references': references})}\n"
+
+                response_stream = llm_response.get("response_iterator")
+                if response_stream:
+                    try:
+                        async for chunk in response_stream:
+                            if chunk:
+                                yield f"{json.dumps({'response': chunk})}\n"
+                    except Exception as e:
+                        logger.error(f"Streaming error: {str(e)}")
+                        yield f"{json.dumps({'error': str(e)})}\n"
+
+                # Re-snapshot token usage AFTER the stream completes.
+                # Streaming LLM providers only call ``llm_tracker.add(...)``
+                # once the stream ends, so the pre-stream snapshot in
+                # ``result`` carries only the embedding call. The
+                # ``_refresh_token_usage`` callable was attached by
+                # ``aquery_llm`` exactly for this purpose; it re-reads the
+                # same trackers and now sees the LLM call_count populated.
+                refresh_token_usage = result.get("_refresh_token_usage")
+                if callable(refresh_token_usage):
+                    result.update(refresh_token_usage())
+                token_usage = _build_token_usage_response(result)
+                token_usage_dump = (
+                    token_usage.model_dump(exclude_none=True) if token_usage else None
+                )
+
+                # Emit token usage as a trailing NDJSON frame so streaming
+                # clients can record cost without re-querying.
+                if token_usage_dump is not None:
+                    yield f"{json.dumps({'token_usage': token_usage_dump})}\n"
+            else:
+                # Non-streaming: complete response in one message.
+                # The LLM call has already completed by the time aquery_llm
+                # returned, so the snapshot in ``result`` already reflects the
+                # full LLM usage and no refresh is needed here.
+                response_content = llm_response.get("content", "")
+                if not response_content:
+                    response_content = "No relevant context found for the query."
+
+                complete_response = {"response": response_content}
+                if include_references:
+                    complete_response["references"] = references
+
+                token_usage = _build_token_usage_response(result)
+                if token_usage is not None:
+                    complete_response["token_usage"] = token_usage.model_dump(
+                        exclude_none=True
+                    )
+
+                yield f"{json.dumps(complete_response)}\n"
+
+            if include_response_time:
+                # Final metadata line: total server-side processing time
+                # (retrieval + LLM generation) for opted-in clients.
+                yield f"{json.dumps({'response_time': round(time.perf_counter() - start_time, 3)})}\n"
+
+        return _generate
 
     @router.post(
         "/query/stream",
@@ -628,9 +848,15 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
         **Response Modes:**
         - Real-time response delivery as content is generated
         - NDJSON format: each line is a separate JSON object
-        - First line: `{"references": [...]}` (if include_references=True)
-        - Subsequent lines: `{"response": "content chunk"}`
-        - Error handling: `{"error": "error message"}`
+        - Default order (``include_progress=False``):
+          - First line: `{"references": [...]}` (if include_references=True)
+          - Subsequent lines: `{"response": "content chunk"}`
+          - Error handling: `{"error": "error message"}`
+        - With ``include_progress=True`` (opt-in):
+          - Progress lines: `{"progress": "step_name"}` emitted **before** references
+          - Then references, response chunks, and errors as above
+          - Final line: `{"response_time": 1.234}`
+          - Clients that depend on references being the first line must not enable ``include_progress``
 
         > If stream parameter is False, or the query hit LLM cache, complete response delivered in a single streaming message.
 
@@ -682,6 +908,21 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
         }
         ```
 
+        Streaming with retrieval progress (opt-in):
+        ```json
+        {
+            "query": "Explain neural networks",
+            "mode": "mix",
+            "stream": true,
+            "include_progress": true
+        }
+        ```
+        Progress lines (`{"progress": "extracting_keywords"}`, etc.) are emitted
+        before references and response chunks, letting the client show live
+        pipeline status. A final `{"response_time": 1.234}` metadata line follows
+        the response. Omit ``include_progress`` (or set it to ``false``) to keep
+        the original protocol shape with no progress or timing metadata lines.
+
         Conversation with context:
         ```json
         {
@@ -722,6 +963,7 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                 - **mode**: Query strategy - "mix" recommended for best results
                 - **stream**: Enable streaming (True) or complete response (False)
                 - **include_references**: Whether to include source citations
+                - **include_progress**: If True, emit retrieval progress events before references and a final response_time metadata line (default: False)
                 - **response_type**: Format preference (e.g., "Multiple Paragraphs")
                 - **top_k**: Number of top entities/relations to retrieve
                 - **conversation_history**: Previous dialogue context for multi-turn conversations
@@ -730,9 +972,11 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
         Returns:
             StreamingResponse: NDJSON streaming response containing:
                 - **Streaming mode**: Multiple JSON objects, one per line
+                  - Progress objects (only if include_progress=True): `{"progress": "step_name"}`
                   - References object (if requested): `{"references": [...]}`
                   - Content chunks: `{"response": "chunk content"}`
                   - Error objects: `{"error": "error message"}`
+                  - Final timing object (only if include_progress=True): `{"response_time": 1.234}`
                 - **Non-streaming mode**: Single JSON object
                   - Complete response: `{"references": [...], "response": "complete content"}`
 
@@ -752,110 +996,124 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
 
             from fastapi.responses import StreamingResponse
 
-            # Unified approach: always use aquery_llm for all cases
-            result = await rag.aquery_llm(request.query, param=param)
+            start_time = time.perf_counter()
 
-            async def stream_generator():
-                # Extract references and LLM response from unified result
-                references = result.get("data", {}).get("references", [])
-                llm_response = result.get("llm_response", {})
+            # When the client opts in via include_progress, run aquery_llm as a
+            # background task so progress events can be interleaved into the
+            # NDJSON stream before the response chunks. When include_progress
+            # is False (default), use the original blocking path that preserves
+            # the exact protocol order: references → response chunks → time.
+            include_progress = request.include_progress or False
 
-                # Enrich references with chunk content if requested
-                if request.include_references and request.include_chunk_content:
-                    data = result.get("data", {})
-                    chunks = data.get("chunks", [])
-                    # Create a mapping from reference_id to chunk content
-                    ref_id_to_content = {}
-                    for chunk in chunks:
-                        ref_id = chunk.get("reference_id", "")
-                        content = chunk.get("content", "")
-                        if ref_id and content:
-                            # Collect chunk content
-                            ref_id_to_content.setdefault(ref_id, []).append(content)
+            if include_progress:
+                progress_queue: asyncio.Queue = asyncio.Queue()
+                # Sentinel enqueued once the query task settles, so the generator
+                # can drain progress events with a blocking get() instead of
+                # polling task.done() on a 0.1s timeout (which could also drop an
+                # event whenever the timeout raced the get()).
+                done_sentinel = object()
 
-                    # Add content to references
-                    enriched_references = []
-                    for ref in references:
-                        ref_copy = ref.copy()
-                        ref_id = ref.get("reference_id", "")
-                        if ref_id in ref_id_to_content:
-                            # Keep content as a list of chunks (one file may have multiple chunks)
-                            ref_copy["content"] = ref_id_to_content[ref_id]
-                        enriched_references.append(ref_copy)
-                    references = enriched_references
+                async def progress_callback(event: str):
+                    await progress_queue.put(event)
 
-                if llm_response.get("is_streaming"):
-                    # Streaming mode: send references first, then stream response chunks
-                    if request.include_references:
-                        yield f"{json.dumps({'references': references})}\n"
+                async def run_query():
+                    # Wrap aquery_llm so the sentinel is enqueued exactly once the
+                    # query settles — on success, error, or cancellation. The
+                    # finally runs after every progress event the callback awaited
+                    # inside aquery_llm, so the sentinel is always the last queue
+                    # item. put_nowait never blocks on the unbounded queue, which
+                    # keeps the finally safe even while a CancelledError propagates.
+                    try:
+                        return await rag.aquery_llm(
+                            request.query,
+                            param=param,
+                            progress_callback=progress_callback,
+                        )
+                    finally:
+                        progress_queue.put_nowait(done_sentinel)
 
-                    response_stream = llm_response.get("response_iterator")
-                    if response_stream:
+                query_task = asyncio.create_task(run_query())
+
+                include_references = request.include_references
+                include_chunk_content = request.include_chunk_content
+
+                async def merged_generator():
+                    try:
+                        # Drain progress events until the sentinel: a blocking get
+                        # with no polling, no timeout, and no dropped-item race.
+                        while True:
+                            event = await progress_queue.get()
+                            if event is done_sentinel:
+                                break
+                            yield f"{json.dumps({'progress': event})}\n"
+
+                        # Surface any exception from the task (e.g. LLM service
+                        # error). Since the StreamingResponse has already begun
+                        # (progress lines sent), we cannot raise an HTTP 500;
+                        # instead emit a structured NDJSON error line so the
+                        # client receives a well-formed error instead of a
+                        # truncated stream.
                         try:
-                            async for chunk in response_stream:
-                                if chunk:  # Only send non-empty content
-                                    yield f"{json.dumps({'response': chunk})}\n"
+                            result = await query_task
                         except Exception as e:
-                            logger.error(f"Streaming error: {str(e)}")
+                            logger.error(
+                                f"Error in progress-enabled streaming query: {str(e)}",
+                                exc_info=True,
+                            )
                             yield f"{json.dumps({'error': str(e)})}\n"
+                            return
 
-                    # Re-snapshot token usage AFTER the stream completes.
-                    # Streaming LLM providers only call ``llm_tracker.add(...)``
-                    # once the stream ends, so the pre-stream snapshot in
-                    # ``result`` carries only the embedding call. The
-                    # ``_refresh_token_usage`` callable was attached by
-                    # ``aquery_llm`` exactly for this purpose; it re-reads
-                    # the same trackers and now sees the LLM call_count
-                    # populated.
-                    refresh_token_usage = result.get("_refresh_token_usage")
-                    if callable(refresh_token_usage):
-                        result.update(refresh_token_usage())
-                    token_usage = _build_token_usage_response(result)
-                    token_usage_dump = (
-                        token_usage.model_dump(exclude_none=True) if token_usage else None
-                    )
+                        # Yield references + LLM response chunks + response_time.
+                        stream_gen = _build_stream_generator(
+                            result=result,
+                            include_references=include_references,
+                            include_chunk_content=include_chunk_content,
+                            include_response_time=True,
+                            start_time=start_time,
+                        )
+                        async for line in stream_gen():
+                            yield line
+                    finally:
+                        if not query_task.done():
+                            query_task.cancel()
+                            # Wait for cancellation cleanup so the task cannot
+                            # outlive the response generator after disconnect.
+                            await asyncio.gather(query_task, return_exceptions=True)
 
-                    # Emit token usage as the final NDJSON frame so streaming
-                    # clients can record cost without re-querying.
-                    if token_usage_dump is not None:
-                        yield f"{json.dumps({'token_usage': token_usage_dump})}\n"
-                else:
-                    # Non-streaming mode: send complete response in one message.
-                    # The LLM call has already completed by the time aquery_llm
-                    # returned, so the snapshot in ``result`` already reflects
-                    # the full LLM usage and we can build the response model
-                    # directly.
-                    response_content = llm_response.get("content", "")
-                    if not response_content:
-                        response_content = "No relevant context found for the query."
+                return StreamingResponse(
+                    merged_generator(),
+                    media_type="application/x-ndjson",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Content-Type": "application/x-ndjson",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            else:
+                # Default path: no progress events, original protocol order preserved.
+                result = await rag.aquery_llm(request.query, param=param)
+                stream_gen = _build_stream_generator(
+                    result=result,
+                    include_references=request.include_references,
+                    include_chunk_content=request.include_chunk_content,
+                    include_response_time=False,
+                    start_time=start_time,
+                )
 
-                    token_usage = _build_token_usage_response(result)
-                    token_usage_dump = (
-                        token_usage.model_dump(exclude_none=True) if token_usage else None
-                    )
-
-                    # Create complete response object
-                    complete_response = {"response": response_content}
-                    if request.include_references:
-                        complete_response["references"] = references
-                    if token_usage_dump is not None:
-                        complete_response["token_usage"] = token_usage_dump
-
-                    yield f"{json.dumps(complete_response)}\n"
-
-            return StreamingResponse(
-                stream_generator(),
-                media_type="application/x-ndjson",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "Content-Type": "application/x-ndjson",
-                    "X-Accel-Buffering": "no",  # Ensure proper handling of streaming response when proxied by Nginx
-                },
-            )
+                return StreamingResponse(
+                    stream_gen(),
+                    media_type="application/x-ndjson",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Content-Type": "application/x-ndjson",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
         except Exception as e:
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     @router.post(
         "/query/data",
@@ -1273,6 +1531,6 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                 )
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     return router

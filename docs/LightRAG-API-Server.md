@@ -8,6 +8,54 @@ The LightRAG Server is designed to provide a Web UI and API support. The Web UI 
 
 ![image-20250323123011220](./LightRAG-API-Server.assets/image-20250323123011220.png)
 
+## Upgrading from v1.4.16 to v1.5.x
+
+LightRAG v1.5.x adds the new file-processing pipeline, parser routing, multimodal analysis, role-specific LLM/VLM configuration, JSON entity extraction, and several provider/storage changes. Review the [v1.5.0rc2 release notes](https://github.com/HKUDS/LightRAG/releases/tag/v1.5.0rc2) before upgrading a production instance.
+
+- To keep the old file-processing behavior while upgrading the server, set:
+
+```bash
+LIGHTRAG_PARSER=*:legacy-F
+```
+
+- `ENTITY_TYPES` is no longer supported. Use `ENTITY_TYPE_PROMPT_FILE` instead, with a YAML profile stored under `PROMPT_DIR/entity_type` (`PROMPT_DIR` defaults to `./prompts`). A sample template is available at `prompts/samples/entity_type_prompt.sample.yml`.
+- If you use OpenSearch storage and the cluster is older than OpenSearch 3.3.0, upgrade OpenSearch before enabling the v1.5 storage path and validate existing indices. For new deployments, use OpenSearch 3.3.0 or later.
+- Changing the embedding model, embedding dimension, asymmetric embedding behavior, or query/document prefixes changes vector semantics. Clear the affected LightRAG workspace/vector data and re-index source files.
+- Changing parser routing (`LIGHTRAG_PARSER`) or filename hints affects newly uploaded files. To switch an existing document to another parser engine, delete that document and upload it again.
+- Changing chunker settings (`CHUNK_*`) affects documents enqueued after the server restarts. Reprocess older documents if you want their stored `chunk_options` snapshot to match the new settings.
+- Enabling multimodal options (`i/t/e`) requires parsed sidecars plus `VLM_PROCESS_ENABLE=true`. Existing documents can be reprocessed to run VLM analysis on available sidecars; switching extraction engines still requires delete + re-upload.
+
+## Upgrading to bounded request sizes
+
+The release that layers `MAX_REQUEST_BODY_BYTES` turns it **on by default** at 1 MiB, where it used to be off and to cover three ingestion routes only. Two things change for clients:
+
+- **A request body over 1 MiB is refused with 413 on the ordinary routes** — `/query*`, `/api/chat`, `/api/generate` and everything else that is neither an upload nor a text insert. `/documents/text` and `/documents/texts` keep a 50 MiB ceiling, and `/documents/upload` derives its own from `MAX_UPLOAD_SIZE`, so bulk ingestion is unaffected. Set `MAX_REQUEST_BODY_BYTES` to any positive value to govern every non-upload route with it, or `0` to turn every ceiling off.
+- **The model-facing fields now have fixed ceilings**: 64 KiB per query or prompt, 32 KiB per message, 128 KiB of model-facing text per request, 128 messages, `top_k` / `chunk_top_k` at most 1000, and the `max_*_tokens` budgets at most 1,000,000. Clients that relied on unbounded `top_k` or on multi-megabyte queries need adjusting. These are not configurable by design.
+
+Neither change affects a deployment that was already sizing its requests sensibly; both bound how much work one unauthenticated request can ask the server to do.
+
+## Upgrading to bounded pipeline scheduling
+
+The release that introduces `PIPELINE_SCHEDULING_PAGE_SIZE`, `MAX_PENDING_DOCUMENTS` and `MAX_UNACKED_MANUAL_RETRIES` (see `env.example`) also changes the **concurrency protocol** writers use to coordinate through shared state. It is a one-time, in-place upgrade that writes no marker and no protocol version, so the storage cannot detect a stale writer for you. The requirement is therefore operational:
+
+> **Stop every old writer before starting a new one against the same storage and workspace.** A rolling restart that leaves one old worker — or one old instance sharing the same Redis/PostgreSQL workspace — running is the failure case, not a slower upgrade.
+
+Three things an old writer cannot honour:
+
+- **The manual retry freeze.** `/documents/reprocess_failed` no longer resets `FAILED` rows inline. It publishes an intent, freezes ingestion, waits for the pipeline to go idle, and only then rewrites `FAILED`→`PENDING` page by page with no worker running. An old writer does not read the freeze flag, so it keeps enqueueing into a window the reset assumes is exclusive.
+- **The scheduling sort key.** `created_at` is now the immutable `(created_at, id)` keyset cursor, written as a UTC ISO-8601 timestamp. Rows an old writer stamps in another format sort inconsistently against it, and a keyset page can then skip or repeat documents.
+- **Derived indexes.** On Redis the status set and the source multimap are maintained in the same transaction as the document row. An old writer updates the row only, leaving the index stale — after which strict paging and the strict active count silently omit that document.
+
+Recommended sequence:
+
+1. Stop accepting new documents and let the pipeline finish. On the authenticated `/health`, `scheduling.drain_waiting_on_workers` is `false` and `scheduling.drain_pending_enqueues` is `0` when nothing is in flight.
+2. Stop **all** workers and instances that share the storage and workspace.
+3. Start the new version.
+
+No data migration is required. The first sweep after startup is a strict full sweep, so a document an old writer left mid-flight — a row stuck in `PARSING`/`ANALYZING`/`PROCESSING` with no worker behind it — is picked up and reprocessed on its own. If a run genuinely cannot be drained, stopping mid-run is still safe for the same reason; what is not safe is starting the old version again afterwards.
+
+**After starting, check the log for a strict-capability warning.** All five built-in `doc_status` backends (JSON, Redis, PostgreSQL, MongoDB, OpenSearch) have every capability. A third-party backend may not, and each gap fails closed rather than degrading quietly: admission answers 503, the source-conflict endpoints answer 501, and a scan keeps re-examining a stale `FAILED` stub. Startup names each missing capability and what it costs, and the authenticated `/health` reports the same under `capabilities`. Set `PIPELINE_REQUIRE_STRICT_STORAGE_READS=true` to turn those gaps into a startup failure instead. There is no equivalent knob for bounded paging: the paging and typed source-resolution methods are abstract, so a backend without them cannot be constructed at all.
+
 ## Getting Started
 
 ### Installation
@@ -62,18 +110,33 @@ cd ..
 
 ### Before Starting LightRAG Server
 
-LightRAG necessitates the integration of both an LLM (Large Language Model) and an Embedding Model to effectively execute document indexing and querying operations. Prior to the initial deployment of the LightRAG server, it is essential to configure the settings for both the LLM and the Embedding Model. LightRAG supports binding to various LLM/Embedding backends:
+LightRAG necessitates the integration of both an LLM (Large Language Model) and an Embedding Model to effectively execute document indexing and querying operations. Prior to the initial deployment of the LightRAG server, it is essential to configure the settings for both the LLM and the Embedding Model.
+
+LightRAG supports these LLM backends:
 
 * ollama
 * lollms
 * openai or openai compatible
 * azure_openai
-* aws_bedrock
+* bedrock
 * gemini
+
+LightRAG supports these embedding backends:
+
+* lollms
+* ollama
+* openai or openai compatible
+* azure_openai
+* bedrock
+* jina
+* gemini
+* voyageai
 
 It is recommended to use environment variables to configure the LightRAG Server. There is an example environment variable file named `env.example` in the root directory of the project. Please copy this file to the startup directory and rename it to `.env`. After that, you can modify the parameters related to the LLM and Embedding models in the `.env` file. It is important to note that the LightRAG Server will load the environment variables from `.env` into the system environment variables each time it starts. **LightRAG Server will prioritize the settings in the system environment variables to .env file**.
 
 > Since VS Code with the Python extension may automatically load the .env file in the integrated terminal, please open a new terminal session after each modification to the .env file.
+
+If you need to configure different LLMs/VLMs for entity extraction, keyword extraction, final answers, or multimodal analysis, see the [Role-Specific LLM/VLM Configuration Guide](./RoleSpecificLLMConfiguration.md).
 
 Here are some examples of common settings for LLM and Embedding models:
 
@@ -163,6 +226,21 @@ During startup, configurations in the `.env` file can be overridden by command-l
 - `--working-dir`: Database persistence directory (default: ./rag_storage)
 - `--input-dir`: Directory for uploaded files (default: ./inputs)
 - `--workspace`: Workspace name, used to logically isolate data between multiple LightRAG instances (default: empty)
+- `--api-prefix`: Reverse-proxy path prefix exposed to browsers, also configurable with `LIGHTRAG_API_PREFIX`
+- `--rerank-binding`: Rerank provider (`null`, `cohere`, `jina`, or `aliyun`)
+
+### Path Prefix and Multi-Site WebUI
+
+Set `LIGHTRAG_API_PREFIX` or `--api-prefix` when one host serves multiple LightRAG instances behind a reverse proxy. Either forwarding style works: the proxy may strip the site prefix before forwarding to the backend, or forward the request unchanged.
+
+```bash
+LIGHTRAG_API_PREFIX=/site01
+lightrag-server --port 9621
+```
+
+The backend passes this value to FastAPI as `root_path` and injects the same runtime prefix into the WebUI. The WebUI is always mounted at `/webui` inside the server, so one frontend build can serve any prefix. See [Single-Server Multi-Site Deployment](./MultiSiteDeployment.md) for full Nginx, Docker, and Kubernetes examples.
+
+> **`WHITELIST_PATHS` is written without the prefix.** Its entries are internal route paths, exactly as the routes are declared. The mount prefix is removed before matching, in both forwarding styles, so with `LIGHTRAG_API_PREFIX=/site01` the shipped default `WHITELIST_PATHS=/health,/api/*` is already correct and exempts `/site01/health` as the browser sees it. Writing the browser-visible form (`WHITELIST_PATHS=/site01/health`) matches nothing and makes those paths require authentication.
 
 ### Launching LightRAG Server with Docker
 
@@ -179,6 +257,175 @@ docker compose up
 ```
 
 You can get the official docker compose file from here: [docker-compose.yml](https://raw.githubusercontent.com/HKUDS/LightRAG/refs/heads/main/docker-compose.yml). For historical versions of LightRAG docker images, visit this link: [LightRAG Docker Images](https://github.com/HKUDS/LightRAG/pkgs/container/lightrag). For more details about docker deployment, please refer to [DockerDeployment.md](./DockerDeployment.md).
+
+### Progressive Setup Recipes
+
+If you are new to LightRAG, start with the smallest working configuration and add capabilities only after the previous step is healthy:
+
+1. Minimal Docker run with hosted LLM and embedding models
+2. Add reranking to improve query quality
+3. Add multimodal parsing with MinerU and a vision-capable model
+4. Move to a GPU-backed, Docker-managed deployment with database storage
+
+The full `env.example` file remains the complete configuration reference and is used by the `make env-*` setup wizard. The snippets below intentionally show only the values that matter for each step.
+
+#### 1. Minimal Docker Run
+
+Use this path when you want the WebUI and API running first, with no external database, parser service, or local model service. Create `.env` next to `docker-compose.yml` with a minimal OpenAI-compatible configuration:
+
+```bash
+###########################
+### Server Configuration
+###########################
+PORT=9621
+WEBUI_TITLE='My First LightRAG KB'
+WEBUI_DESCRIPTION='Simple and Fast Graph Based RAG System'
+OLLAMA_EMULATING_MODEL_TAG=latest
+
+########################################
+### Document processing configuration
+########################################
+SUMMARY_LANGUAGE=English
+ENTITY_EXTRACTION_USE_JSON=true
+LIGHTRAG_PARSER=*:native-teP,*:legacy-R
+VLM_PROCESS_ENABLE=false
+
+###########################################################################
+### LLM Configuration
+###########################################################################
+LLM_BINDING=openai
+LLM_BINDING_HOST=https://api.openai.com/v1
+LLM_BINDING_API_KEY=your_api_key
+LLM_MODEL=gpt-5-mini
+
+KEYWORD_LLM_MODEL=gpt-5-nano
+QUERY_LLM_MODEL=gpt-5
+
+#######################################################################################
+### Embedding Configuration (do not change after the first file is processed)
+#######################################################################################
+EMBEDDING_BINDING=openai
+EMBEDDING_BINDING_HOST=https://api.openai.com/v1
+EMBEDDING_BINDING_API_KEY=your_api_key
+EMBEDDING_MODEL=text-embedding-3-large
+EMBEDDING_DIM=3072
+EMBEDDING_TOKEN_LIMIT=8192
+EMBEDDING_SEND_DIM=false
+EMBEDDING_USE_BASE64=true
+# Overlap (in tokens) the embedding hard fallback borrows from the previous
+# chunk's tail when a chunk still exceeds EMBEDDING_TOKEN_LIMIT after
+# chunking. Independent of CHUNK_OVERLAP_SIZE. Default 100; 0 disables it.
+# EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE=100
+
+############################
+### Data storage selection
+############################
+LIGHTRAG_KV_STORAGE=JsonKVStorage
+LIGHTRAG_DOC_STATUS_STORAGE=JsonDocStatusStorage
+LIGHTRAG_GRAPH_STORAGE=NetworkXStorage
+LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage
+```
+
+Replace the model IDs with models available in your provider account when needed. Start the service and verify it before uploading documents:
+
+```bash
+docker compose up -d
+curl http://localhost:9621/health
+```
+
+Then open the WebUI at `http://localhost:9621/webui`, upload a small text or DOCX file, wait for indexing to finish, and run a `hybrid` or `mix` query.
+
+#### 2. Add Reranking
+
+Reranking is a query-time improvement. Enabling, disabling, or changing the reranker usually does not require re-indexing existing documents.
+
+For Cohere's official hosted rerank service:
+
+```bash
+RERANK_BINDING=cohere
+RERANK_MODEL=rerank-v3.5
+RERANK_BINDING_HOST=https://api.cohere.com/v2/rerank
+RERANK_BINDING_API_KEY=your_cohere_api_key
+```
+
+For a local vLLM reranker that exposes a Cohere-compatible API:
+
+```bash
+RERANK_BINDING=cohere
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
+RERANK_BINDING_HOST=http://localhost:8000/rerank
+RERANK_BINDING_API_KEY=your_rerank_api_key_here
+```
+
+If LightRAG itself runs inside Docker and the reranker runs on the host, use a host-reachable address such as `host.docker.internal` instead of `localhost`. If the setup wizard creates the vLLM service, it injects the internal Compose service URL into `docker-compose.final.yml` for you.
+
+#### 3. Add Multimodal Parsing With MinerU Official API
+
+Use this after the basic document flow works. The MinerU official API avoids running a local parser service, but `MINERU_API_TOKEN` must be configured before the LightRAG server starts. The VLM role must use a provider/model that supports image input.
+
+```bash
+LIGHTRAG_PARSER=*:native-iteP,*:mineru-iteP,*:legacy-R
+
+VLM_PROCESS_ENABLE=true
+VLM_LLM_MODEL=gpt-5-mini
+
+MINERU_API_MODE=official
+MINERU_API_TOKEN=your_mineru_api_token
+MINERU_OFFICIAL_ENDPOINT=https://mineru.net
+MINERU_MODEL_VERSION=vlm
+MINERU_IS_OCR=false
+```
+
+This routing uses the built-in `native` parser for supported DOCX files, MinerU for other MinerU-supported files such as PDFs and images, and `legacy` as the fallback. The `i`, `t`, and `e` options enable VLM analysis for image, table, and equation sidecars when the parser produces them.
+
+For official mode, Docker does not need a host-loopback MinerU endpoint. The container only needs outbound network access to `MINERU_OFFICIAL_ENDPOINT`.
+
+#### 4. GPU All-In-One Style Deployment
+
+For a local GPU-backed deployment, let the wizard generate `.env` and `docker-compose.final.yml` instead of hand-writing every service block:
+
+```bash
+make env-base
+```
+
+Recommended answers:
+
+- Configure the main LLM as a hosted or OpenAI-compatible provider.
+- Answer `yes` to `Run embedding model locally via Docker (vLLM)?`.
+- Choose `cuda` for the embedding device.
+- Enable reranking, answer `yes` to `Run rerank service locally via Docker?`, and choose `cuda` for the rerank device.
+
+Then configure storage:
+
+```bash
+make env-storage
+```
+
+Recommended storage choices:
+
+- `LIGHTRAG_KV_STORAGE=PGKVStorage`
+- `LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage`
+- `LIGHTRAG_VECTOR_STORAGE=MilvusVectorDBStorage`
+- `LIGHTRAG_GRAPH_STORAGE=MemgraphStorage`
+- Answer `yes` to run PostgreSQL, Milvus, and Memgraph locally via Docker.
+- Choose `cuda` for Milvus if your host has NVIDIA GPU support and the NVIDIA Container Toolkit is installed.
+
+Finally configure server-facing settings and validate the result:
+
+```bash
+make env-server
+make env-validate
+make env-security-check
+docker compose -f docker-compose.final.yml up -d
+```
+
+Before exposing this deployment, configure authentication, API keys, and SSL in `make env-server`. The generated `.env` stays host-usable; container-only service names and Docker-specific overrides are written into `docker-compose.final.yml`.
+
+Important rules before processing production data:
+
+- Choose the embedding model, embedding dimension, and asymmetric embedding settings before the first upload. Changing them later requires clearing the affected workspace/vector data and re-indexing documents.
+- Choose storage backends before the first upload. Direct migration between storage implementations is not supported.
+- Changing `LIGHTRAG_PARSER` affects only newly uploaded files. Delete and upload an existing document again if you want it processed by a different parser route.
 
 ### Nginx Reverse Proxy Configuration
 
@@ -244,10 +491,23 @@ server {
    - Nginx validates the `Content-Length` header first
    - LightRAG performs streaming validation during upload
    - Setting appropriate limits at both layers ensures better error messages and security
+6. **Server-side request limits** (see `env.example`):
+   - `MAX_REQUEST_BODY_BYTES` bounds the raw body of **every** route, counted as it streams through ASGI. Unlike `MAX_UPLOAD_SIZE` (which bounds one uploaded file after multipart parsing), it also stops a body that understates or omits its `Content-Length`, answering **413** before the whole body is read. It is layered, because routes differ by orders of magnitude in what they legitimately carry:
+
+     | Route | Ceiling |
+     |---|---|
+     | ordinary routes (`/query`, `/api/chat`, ...) | `MAX_REQUEST_BODY_BYTES`, default **1 MiB** |
+     | `/documents/text`, `/documents/texts` | **50 MiB**, built in, when `MAX_REQUEST_BODY_BYTES` is not set |
+     | `/documents/upload` | `MAX_UPLOAD_SIZE` + 1 MiB of multipart overhead |
+
+     Setting `MAX_REQUEST_BODY_BYTES` to any positive value makes it govern every non-upload route, ingestion included — including when that value happens to equal the 1 MiB default, which is the behaviour this knob had before the tiers existed. Setting it to `0` turns off every ceiling, including the derived upload one, and the server warns at startup.
+   - **Input field ceilings** apply to the model-facing fields of `/query*`, `/api/chat` and `/api/generate`: 64 KiB per query or prompt, 32 KiB per message, 128 KiB of model-facing text per request, 128 messages, and upper bounds on `top_k` / `chunk_top_k` (1000) and the `max_*_tokens` budgets (1,000,000). These are fixed rather than configurable — a limit that keeps an unauthenticated caller from choosing how much CPU the server spends is worth nothing if it can be misconfigured away. `/query*` answers **422** for an over-limit field (FastAPI's own validation response); `/api/*` answers **413**.
+   - `MAX_TEXTS_PER_REQUEST` bounds how many texts one `/documents/texts` request may carry, answering **413** before any per-text storage lookup. It bounds the fan-out of a single request, so — unlike the capacity limit below — it is not a "retry later" condition: an oversized batch never fits and must be split.
+   - `MAX_PENDING_DOCUMENTS` bounds how many documents may be active (`PENDING`/`PARSING`/`ANALYZING`/`PROCESSING`) or reserved by an in-flight request. Over capacity the server answers **429** with a `Retry-After` header and a detail naming the current count, the requested count and the capacity — refused *before* the body is transferred. `/documents/scan` and manual retries exceed the cap on purpose; the documents they create make ordinary uploads wait.
 
 ### Offline Deployment
 
-Official LightRAG Docker images are fully compatible with offline or air-gapped environments. If you want to build up you own  offline enviroment, please refer to [Offline Deployment Guide](./OfflineDeployment.md).
+Official LightRAG Docker images are fully compatible with offline or air-gapped environments. If you want to build up your own offline environment, please refer to [Offline Deployment Guide](./OfflineDeployment.md).
 
 ### Starting Multiple LightRAG Instances
 
@@ -284,7 +544,7 @@ To maintain compatibility with legacy data, the default workspace for PostgreSQL
 
 ### Multiple workers for Gunicorn + Uvicorn
 
-The LightRAG Server can operate in the `Gunicorn + Uvicorn` preload mode. Gunicorn's multiple worker (multiprocess) capability prevents document indexing tasks from blocking RAG queries. Using CPU-exhaustive document extraction tools, such as docling, can lead to the entire system being blocked in pure Uvicorn mode.
+The LightRAG Server can operate in the `Gunicorn + Uvicorn` preload mode. Gunicorn's multiple worker (multiprocess) capability prevents document indexing tasks from blocking RAG queries. CPU-heavy document extraction tools should be deployed as external services so they do not block the API process.
 
 Though LightRAG Server uses one worker to process the document indexing pipeline, with the async task support of Uvicorn, multiple files can be processed in parallel. The bottleneck of document indexing speed mainly lies with the LLM. If your LLM supports high concurrency, you can accelerate document indexing by increasing the concurrency level of the LLM. Below are several environment variables related to concurrent processing, along with their default values:
 
@@ -292,9 +552,16 @@ Though LightRAG Server uses one worker to process the document indexing pipeline
 ### Number of worker processes, not greater than (2 x number_of_cores) + 1
 WORKERS=2
 ### Number of parallel files to process in one batch
-MAX_PARALLEL_INSERT=2
-### Max concurrent requests to the LLM
-MAX_ASYNC=4
+MAX_PARALLEL_INSERT=3
+### Max concurrent requests to the LLM (MAX_ASYNC is still accepted as a deprecated alias)
+MAX_ASYNC_LLM=4
+```
+
+On macOS, Gunicorn multi-worker mode also requires the Objective-C fork-safety override to be present before the Python process starts. Do not rely on `.env` for this variable; `.env` is loaded after Python startup and is too late for the Objective-C runtime:
+
+```shell
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
+lightrag-gunicorn --workers 2
 ```
 
 ### Install LightRAG as a Linux Service
@@ -302,7 +569,7 @@ MAX_ASYNC=4
 Create your service file `lightrag.service` from the sample file: `lightrag.service.example`. Modify the start options the service file:
 
 ```text
-# Set Enviroment to your Python virtual enviroment
+# Set environment to your Python virtual environment
 Environment="PATH=/home/netman/lightrag-xyj/venv/bin"
 WorkingDirectory=/home/netman/lightrag-xyj
 # ExecStart=/home/netman/lightrag-xyj/venv/bin/lightrag-server
@@ -335,7 +602,7 @@ Open WebUI uses an LLM to do the session title and session keyword generation ta
 
 ### Choose Query mode in chat
 
-The default query mode is `hybrid` if you send a message (query) from the Ollama interface of LightRAG. You can select query mode by sending a message with a query prefix.
+The default query mode is `mix` if you send a message (query) from the Ollama interface of LightRAG. You can select query mode by sending a message with a query prefix.
 
 A query prefix in the query string can determine which LightRAG query mode is used to generate the response for the query. The supported prefixes include:
 
@@ -355,7 +622,7 @@ A query prefix in the query string can determine which LightRAG query mode is us
 /mixcontext
 ```
 
-For example, the chat message `/mix What's LightRAG?` will trigger a mix mode query for LightRAG. A chat message without a query prefix will trigger a hybrid mode query by default.
+For example, the chat message `/hybrid What's LightRAG?` will trigger a hybrid mode query for LightRAG. A chat message without a query prefix will trigger a mix mode query by default.
 
 `/bypass` is not a LightRAG query mode; it will tell the API Server to pass the query directly to the underlying LLM, including the chat history. So the user can use the LLM to answer questions based on the chat history. If you are using Open WebUI as a front end, you can just switch the model to a normal LLM instead of using the `/bypass` prefix.
 
@@ -381,7 +648,9 @@ LIGHTRAG_API_KEY=your-secure-api-key-here
 WHITELIST_PATHS=/health,/api/*
 ```
 
-> Health check and Ollama emulation endpoints are excluded from API Key check by default. For security reasons, remove `/api/*` from `WHITELIST_PATHS` if the Ollama service is not required.
+> Health check and Ollama emulation endpoints are excluded from API Key check by default. For security reasons, remove `/api/*` from `WHITELIST_PATHS` if the Ollama service is not required. `/health` stays whitelisted as a liveness probe but only returns its full configuration to authenticated callers — unauthenticated requests get liveness signals only.
+>
+> **Entries are internal route paths, never prefixed.** A `/*` suffix matches on path-segment boundaries, so `/api/*` covers `/api` and everything under `/api/` and nothing else. If `LIGHTRAG_API_PREFIX` is set, do **not** include it here: the prefix is removed before matching, so `WHITELIST_PATHS=/health` exempts `/site01/health` and `WHITELIST_PATHS=/site01/health` exempts nothing. See [Path Prefix and Multi-Site WebUI](#path-prefix-and-multi-site-webui).
 
 The API key is passed using the request header `X-API-Key`. Below is an example of accessing the LightRAG Server via API:
 
@@ -416,6 +685,8 @@ The command prompts for the password and prints an `admin:{bcrypt}...` entry rea
 
 If Account credentials are not configured, the Web UI will access the system as a Guest. Therefore, even if only an API Key is configured, all APIs can still be accessed through the Guest account, which remains insecure. Hence, to safeguard the API, it is necessary to configure both authentication methods simultaneously.
 
+> Although the server can be configured with **both** an API key and account credentials, a single request should send **either** `X-API-Key` **or** `Authorization: Bearer <token>` — not both. When both headers are present, the `Authorization` token is validated first; if it is invalid or expired the request is rejected with `401 Invalid token` even when a valid `X-API-Key` is also supplied.
+
 ## For Azure OpenAI Backend
 
 Azure OpenAI API can be created using the following commands in Azure CLI (you need to install Azure CLI first from [https://docs.microsoft.com/en-us/cli/azure/install-azure-cli](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli)):
@@ -433,7 +704,6 @@ az cognitiveservices account deployment create --resource-group $RESOURCE_GROUP_
 az cognitiveservices account deployment create --resource-group $RESOURCE_GROUP_NAME  --model-format OpenAI --name $RESOURCE_NAME --deployment-name text-embedding-3-large --model-name text-embedding-3-large --model-version "1"  --sku-capacity 80 --sku-name "Standard"
 az cognitiveservices account show --name $RESOURCE_NAME --resource-group $RESOURCE_GROUP_NAME --query "properties.endpoint"
 az cognitiveservices account keys list --name $RESOURCE_NAME -g $RESOURCE_GROUP_NAME
-
 ```
 
 The output of the last command will give you the endpoint and the key for the OpenAI API. You can use these values to set the environment variables in the `.env` file.
@@ -469,7 +739,7 @@ LightRAG supports binding to various LLM backends:
 * openai (including openai compatible)
 * azure_openai
 * lollms
-* aws_bedrock
+* bedrock
 * gemini
 
 LightRAG supports binding to various Embedding backends:
@@ -478,25 +748,39 @@ LightRAG supports binding to various Embedding backends:
 * ollama
 * openai (including openai compatible)
 * azure_openai
-* aws_bedrock
+* bedrock
 * jina
 * gemini
 * voyageai
 
 Use environment variables `LLM_BINDING` or CLI argument `--llm-binding` to select the LLM backend type. Use environment variables `EMBEDDING_BINDING` or CLI argument `--embedding-binding` to select the Embedding backend type.
 
+Bedrock ignores `LLM_BINDING_API_KEY` and `EMBEDDING_BINDING_API_KEY`. Use SigV4 credentials through the AWS credential chain, or set the process-level `AWS_BEARER_TOKEN_BEDROCK` environment variable before startup for Bedrock API key / bearer-token auth:
+
+```bash
+LLM_BINDING=bedrock
+LLM_BINDING_HOST=DEFAULT_BEDROCK_ENDPOINT
+LLM_MODEL=us.amazon.nova-lite-v1:0
+AWS_REGION=us-west-2
+# Use the AWS credential chain, or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY,
+# or set AWS_BEARER_TOKEN_BEDROCK before starting the server.
+```
+
 Asymmetric embedding is explicit opt-in. Set `EMBEDDING_ASYMMETRIC=true` only when the selected embedding backend supports either provider task parameters or task prefixes. See [Asymmetric Embedding Configuration](./AsymmetricEmbedding.md) before changing these settings, because existing data must be cleared and files re-indexed after any change.
 
 For LLM and embedding configuration examples, please refer to the `env.example` file in the project's root directory. To view the complete list of configurable options for OpenAI and Ollama-compatible LLM interfaces, use the following commands:
+
 ```
 lightrag-server --llm-binding openai --help
 lightrag-server --llm-binding ollama --help
+lightrag-server --llm-binding gemini --help
 lightrag-server --embedding-binding ollama --help
+lightrag-server --embedding-binding gemini --help
 ```
 
 > Please use OpenAI-compatible method to access LLMs deployed by OpenRouter or vLLM/SGLang. You can pass additional parameters to OpenRouter or vLLM/SGLang through the `OPENAI_LLM_EXTRA_BODY` environment variable to disable reasoning mode or achieve other personalized controls.
 
-Set the max_tokens to **prevent excessively long or endless output loop** during the entity relationship extraction phase for Large Language Model (LLM) responses.  The purpose of setting max_tokens parameter is to truncate LLM output before timeouts occur, thereby preventing document extraction failures. This addresses issues where certain text blocks (e.g., tables or citations) containing numerous entities and relationships can lead to overly long or even endless loop outputs from LLMs. This setting is particularly crucial for locally deployed, smaller-parameter models. Max tokens value can be calculated by this formula: `LLM_TIMEOUT * llm_output_tokens/second` (i.e. `180s * 50 tokens/s = 9000`)
+Set the max_tokens to **prevent excessively long or endless output loop** during the entity relationship extraction phase for Large Language Model (LLM) responses.  The purpose of setting max_tokens parameter is to truncate LLM output before timeouts occur, thereby preventing document extraction failures. This addresses issues where certain text blocks (e.g., tables or citations) containing numerous entities and relationships can lead to overly long or even endless loop outputs from LLMs. This setting is particularly crucial for locally deployed, smaller-parameter models. Max tokens value can be calculated by this formula: `LLM_TIMEOUT * llm_output_tokens/second` (i.e. `240s * 50 tokens/s = 12000`, max_tokens should smaller than 12000)
 
 ```
 # For vLLM/SGLang doployed models, or most of OpenAI compatible API provider
@@ -509,11 +793,86 @@ OLLAMA_LLM_NUM_PREDICT=9000
 OPENAI_LLM_MAX_COMPLETION_TOKENS=9000
 ```
 
+### Role-Specific LLM/VLM Configuration
+
+The server can use different models for different stages without changing client APIs. Four roles are supported:
+
+| Role | Purpose |
+| --- | --- |
+| `EXTRACT` | Entity/relation extraction and merge summaries |
+| `KEYWORD` | Query keyword generation before retrieval |
+| `QUERY` | Final answers, bypass queries, and Ollama-compatible chat responses |
+| `VLM` | Multimodal analysis for images, tables, equations, and similar sidecar items |
+
+If a role is not configured, it inherits the base `LLM_*` settings. Minimal same-provider example:
+
+```bash
+LLM_BINDING=openai
+LLM_MODEL=gpt-5-mini
+LLM_BINDING_HOST=https://api.openai.com/v1
+LLM_BINDING_API_KEY=your_api_key
+
+EXTRACT_LLM_MODEL=gpt-5-mini
+KEYWORD_LLM_MODEL=gpt-5-nano
+QUERY_LLM_MODEL=gpt-5
+VLM_LLM_MODEL=gpt-5-mini
+```
+
+**Recommended models by role:**
+
+- **`EXTRACT`**: Entity-relation extraction runs on every chunk, so a fast, cost-effective mainstream model is enough — a **non-thinking** model (reasoning/thinking mode disabled) is strongly recommended. E.g. GPT-5.6-luna, Claude Haiku, or Gemini-mini (hosted), or DeepSeek-V4-lite / Kimi in China. For local deployment, Qwen3-30B-A3B-Instruct is a reasonable minimum.
+- **`QUERY`**: Writes the final answer from long, noisy context, so choose a *stronger* model than `EXTRACT` to maximize answer quality; a thinking-capable model is fine here.
+- **`KEYWORD`**: A lightweight, latency-sensitive step that **must** use a non-thinking model to keep query latency low; a fast model comparable to `EXTRACT` is enough.
+- **`VLM`**: Any mainstream multimodal model with image-input support works; for local deployment, consider Qwen3.6-35B-A3B.
+- **Embedding / Reranker**: Any mainstream, up-to-date model works. For local deployment, use `BAAI/bge-m3` for embeddings and `BAAI/bge-reranker-v2-m3` for reranking.
+
+Within an acceptable latency and cost budget, prefer the highest-scoring model available (per public benchmarks/leaderboards).
+
+For cross-provider rules, provider-specific options such as `QUERY_OPENAI_LLM_REASONING_EFFORT`, role-level Bedrock SigV4 credentials, and queue behavior, see [Role-Specific LLM/VLM Configuration Guide](./RoleSpecificLLMConfiguration.md).
+
+### Multimodal Analysis Configuration
+
+The parser can produce sidecars for drawings/images, tables, and equations. Analysis of a modality requires the document's `process_options` to contain the matching flag — `i` for images, `t` for tables, `e` for equations — and the corresponding sidecar to exist.
+
+`VLM_PROCESS_ENABLE` gates **images only**. Tables and equations are analyzed by the `EXTRACT` role and run regardless of this switch, so `*:native-teP` works without any VLM configured. With `i` enabled and the VLM unavailable, an image that survives the pre-filters (file present, raster format, both sides at least `VLM_MIN_IMAGE_PIXEL`) **fails the document** rather than being skipped — it lands in `FAILED` with `error_msg` "VLM analysis required but VLM role is not available".
+
+Current vision-capable providers are `openai`, `azure_openai`, `gemini`, `bedrock`, `ollama`, and `anthropic`; `lollms` is rejected for VLM use. Typical configuration:
+
+```bash
+VLM_PROCESS_ENABLE=true
+VLM_LLM_BINDING=openai
+VLM_LLM_MODEL=gpt-4o
+VLM_LLM_BINDING_HOST=https://api.openai.com/v1
+VLM_LLM_BINDING_API_KEY=your_vlm_api_key
+VLM_MAX_IMAGE_BYTES=5242880
+SURROUNDING_LEADING_MAX_TOKENS=2000
+SURROUNDING_TRAILING_MAX_TOKENS=2000
+```
+
+The surrounding-context budgets control how much nearby text is included in VLM and extraction prompts for a multimodal item. Parser and per-file option examples are in [Document and Chunk Processing](#document-and-chunk-processing).
+
 ### Entity Extraction Configuration
 
-* ENABLE_LLM_CACHE_FOR_EXTRACT: Enable LLM cache for entity extraction (default: true)
+Entity extraction is controlled by the base or `EXTRACT` role LLM. Important server-side options:
 
-It's very common to set `ENABLE_LLM_CACHE_FOR_EXTRACT` to true for a test environment to reduce the cost of LLM calls.
+- `ENTITY_EXTRACTION_USE_JSON`: request JSON-structured extraction output. In v1.5 this is recommended for reliability, but it can increase latency.
+- `ENTITY_TYPE_PROMPT_FILE`: file-name-only YAML profile for entity type guidance and examples. The file is loaded from `PROMPT_DIR/entity_type`; do not pass an absolute path here.
+- `MAX_EXTRACT_INPUT_TOKENS`: maximum token budget for one extraction input context.
+- `MAX_EXTRACTION_RECORDS`: per-response cap for total entity and relationship records.
+- `MAX_EXTRACTION_ENTITIES`: per-response cap for entity records.
+
+Example:
+
+```bash
+ENTITY_EXTRACTION_USE_JSON=true
+ENTITY_TYPE_PROMPT_FILE=entity_type_prompt.yml
+PROMPT_DIR=/opt/lightrag/prompts
+MAX_EXTRACT_INPUT_TOKENS=20480
+MAX_EXTRACTION_RECORDS=100
+MAX_EXTRACTION_ENTITIES=40
+```
+
+If an old `.env` still contains `ENTITY_TYPES`, remove it before startup. The server fails fast because this variable has been replaced by prompt profiles.
 
 ### Storage Types Supported
 
@@ -524,20 +883,55 @@ LightRAG uses 4 types of storage for different purposes:
 * GRAPH_STORAGE: entity relation graph
 * DOC_STATUS_STORAGE: document indexing status
 
-LightRAG Server offers various storage implementations, with the default being an in-memory database that persists data to the WORKING_DIR directory. Additionally, LightRAG supports a wide range of storage solutions including PostgreSQL, MongoDB, FAISS, Milvus, Qdrant, Neo4j, Memgraph, and Redis. For detailed information on supported storage options, please refer to the storage section in the README.md file located in the root directory.
+Each storage type offers multiple implementations. By default, LightRAG Server uses in-memory databases with data persisted to the WORKING_DIR directory. This is suitable for quickly evaluating the project but is not recommended for production. The implementations currently available for each storage type are listed below:
 
-**Milvus Index Configuration:** LightRAG now supports configurable index types for Milvus vector storage (AUTOINDEX, HNSW, HNSW_SQ, IVF_FLAT, etc.) through environment variables. HNSW_SQ requires Milvus 2.6.8+ and provides significant memory savings. See the "Using Milvus for Vector Storage" section in the main README.md for complete configuration options.
+| Storage Type | Available Implementations (Default First) |
+|---|---|
+| KV_STORAGE | `JsonKVStorage`, `RedisKVStorage`, `PGKVStorage`, `MongoKVStorage`, `OpenSearchKVStorage` |
+| VECTOR_STORAGE | `NanoVectorDBStorage`, `MilvusVectorDBStorage`, `PGVectorStorage`, `FaissVectorDBStorage`, `QdrantVectorDBStorage`, `MongoVectorDBStorage`, `OpenSearchVectorDBStorage` |
+| GRAPH_STORAGE | `NetworkXStorage`, `Neo4JStorage`, `PGTableGraphStorage`, `PGGraphStorage`, `MongoGraphStorage`, `MemgraphStorage`, `OpenSearchGraphStorage` |
+| DOC_STATUS_STORAGE | `JsonDocStatusStorage`, `RedisDocStatusStorage`, `PGDocStatusStorage`, `MongoDocStatusStorage`, `OpenSearchDocStatusStorage` |
+
+For production deployments, PostgreSQL, MongoDB, or OpenSearch can provide all four storage types through a single backend. You can also select a specialized database for each storage type, such as Milvus or Qdrant for vector storage and Neo4j or Memgraph for graph storage.
+
+**PostgreSQL Graph Storage — prefer `PGTableGraphStorage`:** For new PostgreSQL deployments, `PGTableGraphStorage` is the recommended `GRAPH_STORAGE` implementation and supersedes `PGGraphStorage`. It keeps the entity-relation graph in ordinary tables — JSONB properties plus B-tree indexes — instead of going through Apache AGE, which brings two practical advantages:
+
+* **No extension to install.** `PGGraphStorage` requires the Apache AGE extension, which most managed PostgreSQL services (Amazon RDS, Cloud SQL, Supabase, Neon) do not offer — so the graph layer frequently could not run on the same database as the other three storage types. `PGTableGraphStorage` runs on any stock PostgreSQL 14+ and creates the tables it needs during `initialize()`. For a Docker deployment this means the official `pgvector/pgvector:pg18` image is sufficient; the AGE-bundled `gzdaniel/postgres-for-rag:pg18-age-pgvector` image is only needed by `PGGraphStorage`.
+* **Substantially faster.** Queries are plain indexed SQL rather than Cypher over `agtype`, and `get_knowledge_graph` uses a frontier-capped BFS bounded by `max_nodes`. From the measurements published with [PR #3103](https://github.com/HKUDS/LightRAG/pull/3103) (PostgreSQL 18, an 8k-node / ~40k-edge graph, both backends `VACUUM ANALYZE`d before measuring): `get_knowledge_graph` p50 **39 ms vs 1,099 ms (~28×)**, bulk graph load **3.0 s vs 434 s**, mixed-workload throughput **1,431 vs 73 RPS**.
+
+Both implementations read the same `POSTGRES_*` environment variables, but they store the graph in different places — `PGTableGraphStorage` in its own `lightrag_graph_nodes` / `lightrag_graph_edges` tables, `PGGraphStorage` inside an AGE graph. Switching an existing deployment is therefore not an in-place migration: the previously extracted graph will not be visible and the documents have to be re-indexed (the LLM cache can be carried over — see *LLM Cache Migration Between Storage Types* below). `PGGraphStorage` remains supported for deployments already running on AGE.
+
+The environment variables required at startup for each storage implementation are listed below. Implementations not listed require no additional configuration and rely only on file persistence under WORKING_DIR.
+
+| Storage Implementation | Required Environment Variables |
+|---|---|
+| `PGKVStorage` / `PGVectorStorage` / `PGGraphStorage` / `PGTableGraphStorage` / `PGDocStatusStorage` | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE` (plus `POSTGRES_HOST` and `POSTGRES_PORT`) |
+| `Neo4JStorage` | `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` |
+| `MongoKVStorage` / `MongoVectorDBStorage` / `MongoGraphStorage` / `MongoDocStatusStorage` | `MONGO_URI`, `MONGO_DATABASE` (`MongoVectorDBStorage` requires a MongoDB deployment that supports Atlas Search / Vector Search) |
+| `RedisKVStorage` / `RedisDocStatusStorage` | `REDIS_URI` |
+| `MilvusVectorDBStorage` | `MILVUS_URI`, `MILVUS_DB_NAME` |
+| `QdrantVectorDBStorage` | `QDRANT_URL` (`QDRANT_API_KEY` is optional) |
+| `MemgraphStorage` | `MEMGRAPH_URI` |
+| `OpenSearchKVStorage` / `OpenSearchVectorDBStorage` / `OpenSearchGraphStorage` / `OpenSearchDocStatusStorage` | `OPENSEARCH_HOSTS` |
+
+The `WORKSPACE` environment variable isolates data for multiple LightRAG instances on the same backend (valid characters are `a-z`, `A-Z`, `0-9`, and `_`). Each storage backend also provides a backend-specific override such as `POSTGRES_WORKSPACE` or `NEO4J_WORKSPACE`. These overrides are retained only for compatibility with legacy configurations; under normal circumstances, use `WORKSPACE` consistently.
+
+The table above lists only the connection parameters required at startup. Each storage implementation also provides many optional tuning environment variables, including connection pool sizes, SSL settings, sharding thresholds for batch writes and deletions, and vector index parameters. For the complete list and default values, see the repository's root-level `env.example`, where the variables are grouped by storage backend and include detailed comments.
+
+**Milvus Index Configuration:** LightRAG now supports configurable index types for Milvus vector storage (AUTOINDEX, HNSW, HNSW_SQ, IVF_FLAT, etc.) through environment variables. HNSW_SQ requires Milvus 2.6.8+ and provides significant memory savings. For the complete configuration options, see [MilvusConfigurationGuide.md](./MilvusConfigurationGuide.md).
 
 You can select the storage implementation by configuring environment variables. For instance, prior to the initial launch of the API server, you can set the following environment variable to specify your desired storage implementation:
 
 ```
 LIGHTRAG_KV_STORAGE=PGKVStorage
 LIGHTRAG_VECTOR_STORAGE=PGVectorStorage
-LIGHTRAG_GRAPH_STORAGE=PGGraphStorage
+LIGHTRAG_GRAPH_STORAGE=PGTableGraphStorage
 LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
 ```
 
 You cannot change storage implementation selection after adding documents to LightRAG. Data migration from one storage implementation to another is not supported yet. For further information, please read the sample `.env.example` file.
+
+> The [dev-lancedb](https://github.com/HKUDS/LightRAG/tree/dev-lancedb) development branch provides community-contributed LanceDB storage implementations for all four storage types: key-value (KV), vector, graph, and document status. The [dev-nebula-graph](https://github.com/HKUDS/LightRAG/tree/dev-nebula-graph) development branch provides a community-contributed Nebula graph storage implementation. Developers who need these storage options are welcome to try them and help improve them.
 
 ### LLM Cache Migration Between Storage Types
 
@@ -545,21 +939,26 @@ When switching the storage implementation in LightRAG, the LLM cache can be migr
 
 ### LightRAG API Server Command Line Options
 
-| Parameter             | Default       | Description                                                                                                                     |
-| --------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| --host                | 0.0.0.0       | Server host                                                                                                                     |
-| --port                | 9621          | Server port                                                                                                                     |
-| --working-dir         | ./rag_storage | Working directory for RAG storage                                                                                               |
-| --input-dir           | ./inputs      | Directory containing input documents                                                                                            |
-| --max-async           | 4             | Maximum number of async operations                                                                                              |
-| --log-level           | INFO          | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)                                                                           |
-| --verbose             | -             | Verbose debug output (True, False)                                                                                              |
-| --key                 | None          | API key for authentication. Protects the LightRAG server against unauthorized access                                            |
-| --ssl                 | False         | Enable HTTPS                                                                                                                    |
-| --ssl-certfile        | None          | Path to SSL certificate file (required if --ssl is enabled)                                                                     |
-| --ssl-keyfile         | None          | Path to SSL private key file (required if --ssl is enabled)                                                                     |
-| --llm-binding         | ollama        | LLM binding type (lollms, ollama, openai, openai-ollama, azure_openai, aws_bedrock)                                                          |
-| --embedding-binding   | ollama        | Embedding binding type (lollms, ollama, openai, azure_openai, aws_bedrock, jina, gemini, voyageai)                                           |
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `--host` | `0.0.0.0` | Server host |
+| `--port` | `9621` | Server port |
+| `--working-dir` | `./rag_storage` | Working directory for RAG storage |
+| `--input-dir` | `./inputs` | Directory containing uploaded/input documents |
+| `--timeout` | `150` | Gunicorn worker timeout and fallback request timeout |
+| `--max-async` | `4` | Maximum concurrent LLM operations |
+| `--log-level` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
+| `--verbose` | `False` | Verbose debug output, effective with debug logging |
+| `--key` | `None` | API key for authentication |
+| `--ssl` | `False` | Enable HTTPS |
+| `--ssl-certfile` | `None` | Path to SSL certificate file, required if `--ssl` is enabled |
+| `--ssl-keyfile` | `None` | Path to SSL private key file, required if `--ssl` is enabled |
+| `--workspace` | `""` | Default workspace for storage isolation |
+| `--api-prefix` | `""` | Reverse-proxy path prefix, also configurable with `LIGHTRAG_API_PREFIX` |
+| `--workers` | `1` | Gunicorn worker count |
+| `--llm-binding` | `ollama` | LLM binding type (`lollms`, `ollama`, `openai`, `openai-ollama`, `azure_openai`, `bedrock`, `gemini`) |
+| `--embedding-binding` | `ollama` | Embedding binding type (`lollms`, `ollama`, `openai`, `azure_openai`, `bedrock`, `jina`, `gemini`, `voyageai`) |
+| `--rerank-binding` | `null` | Rerank binding type (`null`, `cohere`, `jina`, `aliyun`) |
 
 ### Reranking Configuration
 
@@ -578,7 +977,7 @@ RERANK_BINDING_HOST=http://localhost:8000/rerank
 RERANK_BINDING_API_KEY=your_rerank_api_key_here
 ```
 
-Here is an example configuration for utilizing the Reranker service provided by Aliyun:
+Here is an example configuration for utilizing the Reranker service provided by Aliyun (`gte-rerank-*` and `qwen3-vl-rerank`, which use the nested `input`/`parameters` payload format):
 
 ```
 RERANK_BINDING=aliyun
@@ -587,7 +986,23 @@ RERANK_BINDING_HOST=https://dashscope.aliyuncs.com/api/v1/services/rerank/text-r
 RERANK_BINDING_API_KEY=your_rerank_api_key_here
 ```
 
-For comprehensive reranker configuration examples, please refer to the `env.example` file.
+> **Aliyun `qwen3-rerank` series:** Unlike `gte-rerank-*` and `qwen3-vl-rerank`, the `qwen3-rerank` models use a flat, Cohere-style payload (`{"model", "query", "documents", "top_n", ...}`), return top-level `results`, and are served from a **different**, Cohere-compatible endpoint — `/compatible-api/v1/reranks`, not the `.../text-rerank/text-rerank` path used above. Because the format is identical to standard Cohere, configure them with `RERANK_BINDING=cohere` (not `aliyun`); no dedicated binding is needed. Replace `{WorkspaceId}` and the region with your own (see the [Aliyun Text Rerank API docs](https://help.aliyun.com/zh/model-studio/text-rerank-api)):
+
+```
+RERANK_BINDING=cohere
+RERANK_MODEL=qwen3-rerank
+RERANK_BINDING_HOST=https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-api/v1/reranks
+RERANK_BINDING_API_KEY=your_rerank_api_key_here
+```
+
+Reranker calls have their own concurrency and timeout controls:
+
+```bash
+MAX_ASYNC_RERANK=4
+RERANK_TIMEOUT=30
+```
+
+`MAX_ASYNC_RERANK` falls back to `MAX_ASYNC_LLM` when unset (`MAX_ASYNC` is still accepted as a deprecated alias). `RERANK_TIMEOUT` has an independent default because reranker requests are usually shorter than LLM generation requests. For comprehensive reranker configuration examples, including Cohere-compatible chunking options and Jina/Aliyun endpoints, refer to the `env.example` file.
 
 ### Enable Reranking
 
@@ -654,25 +1069,49 @@ The `include_chunk_content` parameter (default: `false`) controls whether the ac
 
 ### .env Examples
 
+The examples below are reference snippets for tuning existing deployments. For a first run, follow [Progressive Setup Recipes](#progressive-setup-recipes) instead of copying the entire `env.example` file by hand.
+
 ```bash
 ### Server Configuration
 # HOST=0.0.0.0
 PORT=9621
 WORKERS=2
+# LIGHTRAG_API_PREFIX=/site01
 
 ### Settings for document indexing
-ENABLE_LLM_CACHE_FOR_EXTRACT=true
+ENTITY_EXTRACTION_USE_JSON=true
+# ENTITY_TYPE_PROMPT_FILE=entity_type_prompt.yml
+# MAX_EXTRACT_INPUT_TOKENS=20480
+# MAX_EXTRACTION_RECORDS=100
+# MAX_EXTRACTION_ENTITIES=40
 SUMMARY_LANGUAGE=Chinese
-MAX_PARALLEL_INSERT=2
+MAX_PARALLEL_INSERT=3
+LIGHTRAG_PARSER=*:native-teP,*:legacy-R
+# CHUNK_R_SEPARATORS=["\n\n","\n","。","！","？","；","，"," ",""]
+# CHUNK_P_SIZE=2000
 
 ### LLM Configuration (Use valid host. For local services installed with docker, you can use host.docker.internal)
 TIMEOUT=150
-MAX_ASYNC=4
+MAX_ASYNC_LLM=4
 
 LLM_BINDING=openai
 LLM_MODEL=gpt-4o-mini
 LLM_BINDING_HOST=https://api.openai.com/v1
 LLM_BINDING_API_KEY=your-api-key
+KEYWORD_LLM_MODEL=gpt-4o-mini
+QUERY_LLM_MODEL=gpt-4o
+
+### Optional VLM configuration for documents using i/t/e process options
+VLM_PROCESS_ENABLE=false
+# VLM_LLM_MODEL=gpt-4o
+# VLM_MAX_IMAGE_BYTES=5242880
+# SURROUNDING_LEADING_MAX_TOKENS=2000
+# SURROUNDING_TRAILING_MAX_TOKENS=2000
+
+### Optional reranker configuration
+RERANK_BINDING=null
+# MAX_ASYNC_RERANK=4
+# RERANK_TIMEOUT=30
 
 ### Embedding Configuration (Use valid host. For local services installed with docker, you can use host.docker.internal)
 # see also env.ollama-binding-options.example for fine tuning ollama
@@ -698,35 +1137,111 @@ EMBEDDING_BINDING_HOST=http://localhost:11434
 
 ## Document and Chunk Processing
 
-The document processing pipeline in LightRAG is somewhat complex and is divided into two primary stages: the Extraction stage (entity and relationship extraction) and the Merging stage (entity and relationship merging). There are two key parameters that control pipeline concurrency: the maximum number of files processed in parallel (MAX_PARALLEL_INSERT) and the maximum number of concurrent LLM requests (MAX_ASYNC). The workflow is described as follows:
+v1.5 introduces a staged document pipeline. Files first go through a content extraction engine, optional multimodal analysis, text chunking, and then entity/relation extraction unless the file disables knowledge graph construction.
 
-1. MAX_ASYNC limits the total number of concurrent LLM requests in the system, including those for querying, extraction, and merging. LLM requests have different priorities: query operations have the highest priority, followed by merging, and then extraction.
-2. MAX_PARALLEL_INSERT controls the number of files processed in parallel during the extraction stage. For optimal performance, MAX_PARALLEL_INSERT is recommended to be set between 2 and 10, typically MAX_ASYNC/3. Setting this value too high can increase the likelihood of naming conflicts among entities and relationships across different documents during the merge phase, thereby reducing its overall efficiency.
-3. Within a single file, entity and relationship extractions from different text blocks are processed concurrently, with the degree of concurrency set by MAX_ASYNC. Only after MAX_ASYNC text blocks are processed will the system proceed to the next batch within the same file.
-4. When a file completes entity and relationship extraction, it enters the entity and relationship merging stage. This stage also processes multiple entities and relationships concurrently, with the concurrency level also controlled by `MAX_ASYNC`.
-5. LLM requests for the merging stage are prioritized over the extraction stage to ensure that files in the merging phase are processed quickly and their results are promptly updated in the vector database.
-6. To prevent race conditions, the merging stage avoids concurrent processing of the same entity or relationship. When multiple files involve the same entity or relationship that needs to be merged, they are processed serially.
-7. Each file is treated as an atomic processing unit in the pipeline. A file is marked as successfully processed only after all its text blocks have completed extraction and merging. If any error occurs during processing, the entire file is marked as failed and must be reprocessed.
-8. When a file is reprocessed due to errors, previously processed text blocks can be quickly skipped thanks to LLM caching. Although LLM cache is also utilized during the merging stage, inconsistencies in merging order may limit its effectiveness in this stage.
-9. If an error occurs during extraction, the system does not retain any intermediate results. If an error occurs during merging, already merged entities and relationships might be preserved; when the same file is reprocessed, re-extracted entities and relationships will be merged with the existing ones, without impacting the query results.
-10. At the end of the merging stage, all entity and relationship data are updated in the vector database. Should an error occur at this point, some updates may be retained. However, the next processing attempt will overwrite previous results, ensuring that successfully reprocessed files do not affect the integrity of future query results.
+### Quick Recipes
 
-Large files should be divided into smaller segments to enable incremental processing. Reprocessing of failed files can be initiated by pressing the "Scan" button on the web UI.
+Keep v1.4-compatible behavior:
+
+```bash
+LIGHTRAG_PARSER=*:legacy-F
+```
+
+Recommended starting point without external parser services:
+
+```bash
+LIGHTRAG_PARSER=*:native-teP,*:legacy-R
+```
+
+This uses the built-in `native` parser for supported files, enables table/equation sidecar analysis options for those files, uses paragraph semantic chunking where possible, and falls back to legacy extraction plus recursive chunking for other files.
+
+Full multimodal setup with the MinerU official API and a VLM:
+
+```bash
+LIGHTRAG_PARSER=*:native-iteP,*:mineru-iteP,*:legacy-R
+VLM_PROCESS_ENABLE=true
+VLM_LLM_MODEL=gpt-4o
+MINERU_API_MODE=official
+MINERU_API_TOKEN=your_mineru_api_token
+MINERU_OFFICIAL_ENDPOINT=https://mineru.net
+MINERU_MODEL_VERSION=vlm
+MINERU_IS_OCR=false
+```
+
+Use `DOCLING_ENDPOINT=http://localhost:5001` when routing files to `docling`.
+
+### Parser Engines and Routing
+
+`LIGHTRAG_PARSER` defines default extraction rules by file extension. Rules are matched left to right and can be separated by commas or semicolons:
+
+```bash
+LIGHTRAG_PARSER=pdf:mineru-R,docx:native-ietP,*:legacy-R
+```
+
+Supported engines:
+
+| Engine | Use case |
+| --- | --- |
+| `legacy` | Original extraction behavior. Good for compatibility and simple text-like files. |
+| `native` | Built-in structured parser, currently focused on `.docx` and LightRAG Document sidecars. |
+| `mineru` | External MinerU parser for PDFs, Office files, and images. Requires `MINERU_API_MODE` plus `MINERU_LOCAL_ENDPOINT` or `MINERU_API_TOKEN`. |
+| `docling` | External docling-serve parser for PDFs, Office files, Markdown/HTML, and images. Requires `DOCLING_ENDPOINT`. |
+
+Filename hints override the default rule for one uploaded file:
+
+```text
+paper.[mineru-iteP].pdf
+memo.[native-R!].docx
+notes.[-R].md
+```
+
+The `/documents/upload` and `/documents/scan` paths honor filename hints and `LIGHTRAG_PARSER`. The `/documents/text` and `/documents/texts` endpoints insert already-provided text and currently use fixed chunking on the server path.
+
+### Processing Options
+
+Processing options are appended after the engine with a hyphen, or supplied alone in a filename hint with `[-OPTIONS]`.
+
+| Option | Meaning |
+| --- | --- |
+| `i` | Run VLM analysis for image/drawing sidecars when present |
+| `t` | Run VLM analysis for table sidecars when present |
+| `e` | Run VLM analysis for equation sidecars when present |
+| `!` | Skip entity/relation extraction and graph writes; chunk vectors are still stored |
+| `F` | Fixed token chunking, the legacy chunking method |
+| `R` | Recursive character chunking with configurable separator cascade |
+| `V` | Semantic vector chunking; oversize chunks are re-split by `R` |
+| `P` | Paragraph semantic chunking for structured LightRAG Document content; falls back to `R` when structured content is unavailable |
+
+At most one of `F`, `R`, `V`, and `P` should be selected for a file. Chunker parameters are configured with `CHUNK_SIZE`, `CHUNK_OVERLAP_SIZE`, and strategy-specific variables such as `CHUNK_R_SEPARATORS`, `CHUNK_V_BREAKPOINT_THRESHOLD_TYPE`, `CHUNK_P_SIZE`, and `CHUNK_P_OVERLAP_SIZE`. These values are read at server startup and stored as a per-document `chunk_options` snapshot when a document is enqueued.
+
+The `V` strategy's sentence splitter is the one chunker parameter that cannot be set per request: `CHUNK_V_SENTENCE_SPLIT_REGEX` (or the SDK's `addon_params`) is the only way to change it. `/documents/text` and `/documents/texts` reject a `sentence_split_regex` key inside `chunking.params` with HTTP 422. A caller-supplied pattern is applied to that same request's text, and CPython's regex engine holds the GIL while backtracking, so a pattern such as `(a+)+$` can freeze an entire worker process — see [GHSA-32jh-39m7-8x84](https://github.com/HKUDS/LightRAG/security/advisories/GHSA-32jh-39m7-8x84). A value already stored in a document's `chunk_options` snapshot is discarded at processing time as well (logged at `WARNING`), so a pattern persisted by an older build cannot freeze the worker after an upgrade.
+
+The `R` strategy's separator cascade is bounded to 64 entries of at most 256 characters each, wherever it comes from; the built-in cascade is 9. A request body over the limit is rejected with HTTP 422. A non-HTTP configured value is converged and logged once when cached: `CHUNK_R_SEPARATORS` at configuration load, and a supplied or replaced `addon_params['chunker']` immediately (a compatible nested in-place mutation is handled at its first enqueue). The normalized value is then reused for later documents, corrected in place so a caller-held reference to the nested `recursive_character` dict still applies. Direct SDK calls and per-document snapshots persisted before the bound existed retain their stored value and are converged silently at execution, so one stale value cannot warn once per document. A `separators` value that is neither a list/tuple nor `None` is not converged at all — the key is dropped, with its own warning, because bounding a bare string would silently turn it into 64 single-character separators. Converging is not the same as shortening: an entry over 256 characters is **dropped**, while a list over 64 entries is **truncated** to 64 (keeping the trailing char-level `""` sentinel when present). A lone 300-character separator therefore disappears rather than matching its first 256, and the split points come from the fallback cascade — see the [pipeline spec](./FileProcessingPipeline.md#r--recursive-character) for which fallback applies where.
+
+For the full routing syntax, supported extensions, parser cache behavior, chunker configuration, concurrency rules, and Python SDK differences, see [File Processing Pipeline Specification](./FileProcessingPipeline.md). For the `P` strategy details, see [Paragraph Semantic Chunking](./ParagraphSemanticChunking.md). To debug parser output before indexing a file, see [Parser Debug CLI](./ParserDebugCLI.md).
+
+### Pipeline Concurrency
+
+`MAX_PARALLEL_INSERT` controls how many files are processed in parallel. `MAX_ASYNC_LLM` (deprecated alias: `MAX_ASYNC`) controls concurrent LLM calls, including extraction, merging, query keyword generation, and final answer generation. Optional staged-pipeline variables such as `MAX_PARALLEL_PARSE_NATIVE`, `MAX_PARALLEL_PARSE_MINERU`, `MAX_PARALLEL_PARSE_DOCLING`, and `MAX_PARALLEL_ANALYZE` can be used for parser-heavy deployments.
+
+Uploads and text inserts can be accepted while the processing loop is busy; the running loop is nudged to pick up the new pending work. Destructive jobs such as document clear/delete and the classification phase of `/documents/scan` still reject concurrent enqueues to protect storage consistency. Failed files can be reprocessed from the WebUI or by triggering `/documents/scan`.
 
 ## API Endpoints
 
-All servers (LoLLMs, Ollama, OpenAI and Azure OpenAI) provide the same REST API endpoints for RAG functionality. When the API Server is running, visit:
+All supported backends (`lollms`, `ollama`, `openai` / OpenAI-compatible, `azure_openai`, `bedrock`, and `gemini`) expose the same LightRAG REST API surface. When the API Server is running, visit:
 
 - Swagger UI: http://localhost:9621/docs
 - ReDoc: http://localhost:9621/redoc
 
 You can test the API endpoints using the provided curl commands or through the Swagger UI interface. Make sure to:
 
-1. Start the appropriate backend service (LoLLMs, Ollama, or OpenAI)
+1. Start the appropriate backend service or confirm the hosted provider credentials
 2. Start the RAG server
 3. Upload some documents using the document management endpoints
 4. Query the system using the query endpoints
 5. Trigger document scan if new files are put into the inputs directory
+
+The `/health` endpoint reports operational state and selected configuration, including role LLM configuration, LLM/embedding/rerank queue status, workspace/storage workspace mapping, VLM enablement, rerank enablement, and pipeline busy/scanning/destructive status. It always returns HTTP 200 so it stays usable as a liveness probe, but the configuration and operational diagnostics are returned **only to authenticated callers** (valid JWT or `X-API-Key`). Unauthenticated callers receive only liveness signals (`status`, `auth_mode`, `core_version`, `api_version`, `pipeline_busy`/`pipeline_active`, and the WebUI title/availability fields — all of which are also exposed by the unauthenticated `/auth-status` endpoint or are plain booleans). Provide credentials to retrieve the full payload, e.g. `curl -H "X-API-Key: <key>" http://localhost:9621/health`.
 
 ## Asynchronous Document Indexing with Progress Tracking
 
@@ -739,7 +1254,7 @@ LightRAG implements asynchronous document indexing to enable frontend monitoring
 * `/documents/texts`
 
 **Document Processing Status Query Endpoint:**
-* `/track_status/{track_id}`
+* `/documents/track_status/{track_id}`
 
 This endpoint provides comprehensive status information including:
 * Document processing status (pending/processing/processed/failed)

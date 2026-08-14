@@ -5,6 +5,7 @@ import { updateEntity, updateRelation, checkEntityNameExists } from '@/api/light
 import { useGraphStore } from '@/stores/graph'
 import { useSettingsStore } from '@/stores/settings'
 import { SearchHistoryManager } from '@/utils/SearchHistoryManager'
+import { normalizeEntityName } from '@/utils/entityName'
 import { PropertyName, EditIcon, PropertyValue } from './PropertyRowComponents'
 import PropertyEditDialog from './PropertyEditDialog'
 import MergeDialog from './MergeDialog'
@@ -32,6 +33,7 @@ interface EditablePropertyRowProps {
   onValueChange?: (newValue: any) => void  // Optional callback when value changes
   isEditable?: boolean         // Whether this property can be edited
   tooltip?: string             // Optional tooltip to display on hover
+  pipelineBusy?: boolean       // When true, hide edit entry & disable save (pipeline writing)
 }
 
 /**
@@ -51,7 +53,8 @@ const EditablePropertyRow = ({
   targetId,
   onValueChange,
   isEditable = false,
-  tooltip
+  tooltip,
+  pipelineBusy = false
 }: EditablePropertyRowProps) => {
   const { t } = useTranslation()
   const [isEditing, setIsEditing] = useState(false)
@@ -76,6 +79,7 @@ const EditablePropertyRow = ({
   }
 
   const handleEditClick = () => {
+    if (pipelineBusy) return
     if (isEditable && !isEditing) {
       setDraftValue(String(currentValue))
       setDraftAllowMerge(false)
@@ -90,14 +94,36 @@ const EditablePropertyRow = ({
   }
 
   const handleSave = async () => {
-    const value = draftValue.trim()
+    const trimmedValue = draftValue.trim()
     const allowMerge = draftAllowMerge
 
-    if (value === '') {
+    if (trimmedValue === '') {
+      if (name === 'entity_id') {
+        const errorMsg = t('graphPanel.propertiesView.errors.invalidEntityName')
+        setErrorMessage(errorMsg)
+        toast.error(errorMsg)
+      }
       return
     }
 
-    if (isSubmitting || value === String(currentValue)) {
+    if (isSubmitting || trimmedValue === String(currentValue)) {
+      setIsEditing(false)
+      setErrorMessage(null)
+      return
+    }
+
+    const value = name === 'entity_id' ? normalizeEntityName(trimmedValue) : trimmedValue
+    if (name === 'entity_id' && value === '') {
+      const errorMsg = t('graphPanel.propertiesView.errors.invalidEntityName')
+      setErrorMessage(errorMsg)
+      toast.error(errorMsg)
+      return
+    }
+    if (name === 'entity_id' && value !== trimmedValue) {
+      setDraftValue(value)
+    }
+
+    if (value === String(currentValue)) {
       setIsEditing(false)
       setErrorMessage(null)
       return
@@ -275,7 +301,7 @@ const EditablePropertyRow = ({
   return (
     <div className="flex items-center gap-1 overflow-hidden">
       <PropertyName name={name} />
-      <EditIcon onClick={handleEditClick} />:
+      {!pipelineBusy && <EditIcon onClick={handleEditClick} />}:
       <PropertyValue
         value={currentValue}
         onClick={onClick}
@@ -292,6 +318,7 @@ const EditablePropertyRow = ({
         onAllowMergeChange={setDraftAllowMerge}
         isSubmitting={isSubmitting}
         errorMessage={errorMessage}
+        disableSave={pipelineBusy}
       />
 
       <MergeDialog

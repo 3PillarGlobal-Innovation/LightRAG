@@ -7,8 +7,10 @@ import re
 import argparse
 import logging
 from dotenv import load_dotenv
+from lightrag import ROLES
 from lightrag.utils import get_env_value, logger
 from lightrag.llm.binding_options import (
+    BedrockLLMOptions,
     GeminiEmbeddingOptions,
     GeminiLLMOptions,
     OllamaEmbeddingOptions,
@@ -23,7 +25,6 @@ from lightrag.constants import (
     DEFAULT_TIMEOUT,
     DEFAULT_TOP_K,
     DEFAULT_CHUNK_TOP_K,
-    DEFAULT_HISTORY_TURNS,
     DEFAULT_MAX_ENTITY_TOKENS,
     DEFAULT_MAX_RELATION_TOKENS,
     DEFAULT_MAX_TOTAL_TOKENS,
@@ -32,16 +33,26 @@ from lightrag.constants import (
     DEFAULT_MIN_RERANK_SCORE,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
     DEFAULT_MAX_ASYNC,
+    DEFAULT_MAX_PARALLEL_INSERT,
+    DEFAULT_PIPELINE_SCHEDULING_PAGE_SIZE,
+    DEFAULT_PIPELINE_REQUIRE_STRICT_STORAGE_READS,
+    DEFAULT_MAX_PENDING_DOCUMENTS,
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
+    DEFAULT_MAX_TEXTS_PER_REQUEST,
+    DEFAULT_SCAN_ENQUEUE_BATCH_SIZE,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LANGUAGE,
     DEFAULT_EMBEDDING_FUNC_MAX_ASYNC,
     DEFAULT_EMBEDDING_BATCH_NUM,
+    DEFAULT_EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE,
     DEFAULT_OLLAMA_MODEL_NAME,
     DEFAULT_OLLAMA_MODEL_TAG,
     DEFAULT_RERANK_BINDING,
-    DEFAULT_ENTITY_TYPES,
+    DEFAULT_LLM_TIMEOUT,
+    DEFAULT_EMBEDDING_TIMEOUT,
+    DEFAULT_RERANK_TIMEOUT,
 )
 
 # use the .env that is inside the current folder
@@ -70,9 +81,12 @@ def get_default_host(binding_type: str) -> str:
         "lollms": os.getenv("LLM_BINDING_HOST", "http://localhost:9600"),
         "azure_openai": os.getenv("AZURE_OPENAI_ENDPOINT", "https://api.openai.com/v1"),
         "openai": os.getenv("LLM_BINDING_HOST", "https://api.openai.com/v1"),
-        "gemini": os.getenv(
-            "LLM_BINDING_HOST", "https://generativelanguage.googleapis.com"
-        ),
+        # Let boto3 select the regional Bedrock endpoint unless the user
+        # explicitly overrides LLM_BINDING_HOST / EMBEDDING_BINDING_HOST.
+        "bedrock": os.getenv("LLM_BINDING_HOST", "DEFAULT_BEDROCK_ENDPOINT"),
+        # Let google-genai pick the correct default endpoint/version unless the
+        # user explicitly overrides LLM_BINDING_HOST / EMBEDDING_BINDING_HOST.
+        "gemini": os.getenv("LLM_BINDING_HOST", "DEFAULT_GEMINI_ENDPOINT"),
     }
     return default_hosts.get(
         binding_type, os.getenv("LLM_BINDING_HOST", "http://localhost:11434")
@@ -160,6 +174,170 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
         )
 
 
+def validate_scan_batch_configuration(args: argparse.Namespace) -> None:
+    """Reject a non-positive scan enqueue batch size (LR2 §8.2/§11).
+
+    Unlike ``PIPELINE_SCHEDULING_PAGE_SIZE`` — where ``0`` legitimately means
+    "one page holds everything" — there is no unbounded scan batch to fall back
+    to: streaming discovery holds at most this many claimed files before it
+    writes them, so ``0`` or a negative value would mean "never flush" (or flush
+    on every file, depending on how it is read). Fail at startup instead of
+    silently picking one of those readings.
+    """
+    if not hasattr(args, "scan_enqueue_batch_size"):
+        # A programmatic caller may hand ``initialize_config`` a partial
+        # namespace (the documented custom-configuration path); ``parse_args``
+        # always sets this field, so an absent one is not an operator's
+        # misconfiguration. The scan's reader falls back to the bounded default.
+        return
+    batch_size = args.scan_enqueue_batch_size
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size <= 0
+    ):
+        raise ValueError(
+            "SCAN_ENQUEUE_BATCH_SIZE must be a positive integer (it bounds how "
+            f"many discovered files one scan batch holds); got {batch_size!r}"
+        )
+
+
+def validate_admission_configuration(args: argparse.Namespace) -> None:
+    """Reject negative values for the three ingestion ceilings (LR2 §9.1/§11).
+
+    ``0`` legitimately disables each of them, but a negative value would refuse
+    every request — never what an operator meant, and a failure mode that only
+    shows up on the first request.
+    """
+    if not hasattr(args, "max_pending_documents"):
+        # Partial namespace from a programmatic caller — see
+        # validate_scan_batch_configuration.
+        return
+    capacity = args.max_pending_documents
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
+        raise ValueError(
+            "MAX_PENDING_DOCUMENTS must be an integer >= 0 (0 disables "
+            f"admission control); got {capacity!r}"
+        )
+    if hasattr(args, "max_request_body_bytes"):
+        body_limit = args.max_request_body_bytes
+        if (
+            not isinstance(body_limit, int)
+            or isinstance(body_limit, bool)
+            or body_limit < 0
+        ):
+            raise ValueError(
+                "MAX_REQUEST_BODY_BYTES must be an integer >= 0 (0 disables the "
+                f"body limit); got {body_limit!r}"
+            )
+    if hasattr(args, "max_texts_per_request"):
+        texts_limit = args.max_texts_per_request
+        if (
+            not isinstance(texts_limit, int)
+            or isinstance(texts_limit, bool)
+            or texts_limit < 0
+        ):
+            raise ValueError(
+                "MAX_TEXTS_PER_REQUEST must be an integer >= 0 (0 disables the "
+                f"per-request text limit); got {texts_limit!r}"
+            )
+
+
+def _is_set(value: str | None) -> bool:
+    return bool((value or "").strip())
+
+
+def validate_bedrock_auth_configuration(args: argparse.Namespace) -> None:
+    """Reject Bedrock configuration with no explicit supported auth source."""
+    bearer_token = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
+
+    def has_valid_auth(prefix: str | None = None) -> bool:
+        if _is_set(bearer_token):
+            return True
+
+        if prefix:
+            role_access_key = getattr(args, f"{prefix}_aws_access_key_id", None)
+            role_secret_key = getattr(args, f"{prefix}_aws_secret_access_key", None)
+            if _is_set(role_access_key) or _is_set(role_secret_key):
+                return _is_set(role_access_key) and _is_set(role_secret_key)
+
+        access_key = getattr(args, "aws_access_key_id", None)
+        secret_key = getattr(args, "aws_secret_access_key", None)
+        return _is_set(access_key) and _is_set(secret_key)
+
+    if getattr(args, "llm_binding", None) == "bedrock":
+        if not has_valid_auth():
+            raise ValueError(
+                "Bedrock LLM binding requires AWS_ACCESS_KEY_ID and "
+                "AWS_SECRET_ACCESS_KEY, or process-level AWS_BEARER_TOKEN_BEDROCK."
+            )
+        if _is_set(getattr(args, "llm_binding_api_key", None)):
+            logging.warning(
+                "LLM_BINDING_API_KEY is set but ignored for Bedrock LLM binding. "
+                "Use SigV4 AWS_* variables or process-level AWS_BEARER_TOKEN_BEDROCK instead."
+            )
+
+    if getattr(args, "embedding_binding", None) == "bedrock":
+        if not has_valid_auth():
+            raise ValueError(
+                "Bedrock embedding binding requires AWS_ACCESS_KEY_ID and "
+                "AWS_SECRET_ACCESS_KEY, or process-level AWS_BEARER_TOKEN_BEDROCK."
+            )
+        if _is_set(getattr(args, "embedding_binding_api_key", None)):
+            logging.warning(
+                "EMBEDDING_BINDING_API_KEY is set but ignored for Bedrock embedding binding. "
+                "Use SigV4 AWS_* variables or process-level AWS_BEARER_TOKEN_BEDROCK instead."
+            )
+
+    for spec in ROLES:
+        role = spec.name
+        if getattr(
+            args, f"{role}_llm_binding", None
+        ) == "bedrock" and not has_valid_auth(role):
+            raise ValueError(
+                f"Bedrock role '{role}' requires {spec.env_prefix}_AWS_ACCESS_KEY_ID "
+                f"and {spec.env_prefix}_AWS_SECRET_ACCESS_KEY, global "
+                "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or process-level "
+                "AWS_BEARER_TOKEN_BEDROCK."
+            )
+
+
+def normalize_binding_name(binding: str | None) -> str | None:
+    """Normalize environment-provided binding aliases to canonical names."""
+    if binding == "aws_bedrock":
+        return "bedrock"
+    return binding
+
+
+def get_binding_env_value(env_key: str, default: str) -> str:
+    """Read a binding env var and normalize legacy aliases."""
+    return normalize_binding_name(get_env_value(env_key, default)) or default
+
+
+def normalize_api_prefix(value: str | None) -> str:
+    """Canonicalize an API prefix before handing it to FastAPI's ``root_path``.
+
+    Strips surrounding whitespace, ensures a leading slash, drops a trailing
+    slash, and treats empty/"/" as "no prefix". Raw CLI/env input like
+    ``"site01"`` or ``"/site01/"`` would otherwise feed an invalid form to
+    FastAPI and to the WebUI prefix injection.
+
+    Lives here rather than beside its consumer in ``lightrag_server`` because
+    more than one layer has to answer "is there actually a mount prefix?" --
+    ``create_app`` and the startup security banner -- and they must answer it
+    identically. Reading the raw value instead makes ``LIGHTRAG_API_PREFIX=/``
+    look like a prefixed deployment when it is not.
+    """
+    if value is None:
+        return ""
+    value = value.strip()
+    if not value or value == "/":
+        return ""
+    if not value.startswith("/"):
+        value = "/" + value
+    return value.rstrip("/")
+
+
 def parse_args() -> argparse.Namespace:
     """
     Parse command line arguments with environment variable fallback
@@ -209,7 +387,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-async",
         type=int,
-        default=get_env_value("MAX_ASYNC", DEFAULT_MAX_ASYNC, int),
+        default=get_env_value(
+            "MAX_ASYNC_LLM", get_env_value("MAX_ASYNC", DEFAULT_MAX_ASYNC, int), int
+        ),
         help=f"Maximum async operations (default: from env or {DEFAULT_MAX_ASYNC})",
     )
     parser.add_argument(
@@ -317,14 +497,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-binding",
         type=str,
-        default=get_env_value("LLM_BINDING", "ollama"),
+        default=get_binding_env_value("LLM_BINDING", "ollama"),
         choices=[
             "lollms",
             "ollama",
             "openai",
             "openai-ollama",
             "azure_openai",
-            "aws_bedrock",
+            "bedrock",
             "gemini",
         ],
         help="LLM binding type (default: from env or ollama)",
@@ -332,13 +512,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embedding-binding",
         type=str,
-        default=get_env_value("EMBEDDING_BINDING", "ollama"),
+        default=get_binding_env_value("EMBEDDING_BINDING", "ollama"),
         choices=[
             "lollms",
             "ollama",
             "openai",
             "azure_openai",
-            "aws_bedrock",
+            "bedrock",
             "jina",
             "gemini",
             "voyageai",
@@ -351,14 +531,6 @@ def parse_args() -> argparse.Namespace:
         default=get_env_value("RERANK_BINDING", DEFAULT_RERANK_BINDING),
         choices=["null", "cohere", "jina", "aliyun"],
         help=f"Rerank binding type (default: from env or {DEFAULT_RERANK_BINDING})",
-    )
-
-    # Document loading engine configuration
-    parser.add_argument(
-        "--docling",
-        action="store_true",
-        default=False,
-        help="Enable DOCLING document loading engine (default: from env or DEFAULT)",
     )
 
     # Conditionally add binding-specific options (Ollama, OpenAI, Azure OpenAI, Gemini)
@@ -377,7 +549,7 @@ def parse_args() -> argparse.Namespace:
 
     # Fall back to environment variable using same function as argparse default
     if llm_binding_value is None:
-        llm_binding_value = get_env_value("LLM_BINDING", "ollama")
+        llm_binding_value = get_binding_env_value("LLM_BINDING", "ollama")
 
     # Add LLM binding options based on determined value
     if llm_binding_value == "ollama":
@@ -386,6 +558,8 @@ def parse_args() -> argparse.Namespace:
         OpenAILLMOptions.add_args(parser)
     elif llm_binding_value == "gemini":
         GeminiLLMOptions.add_args(parser)
+    elif llm_binding_value == "bedrock":
+        BedrockLLMOptions.add_args(parser)
 
     # Determine embedding binding value consistently from command line or environment
     embedding_binding_value = None
@@ -399,7 +573,7 @@ def parse_args() -> argparse.Namespace:
 
     # Fall back to environment variable using same function as argparse default
     if embedding_binding_value is None:
-        embedding_binding_value = get_env_value("EMBEDDING_BINDING", "ollama")
+        embedding_binding_value = get_binding_env_value("EMBEDDING_BINDING", "ollama")
 
     # Add embedding binding options based on determined value
     if embedding_binding_value == "ollama":
@@ -428,7 +602,61 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Get MAX_PARALLEL_INSERT from environment
-    args.max_parallel_insert = get_env_value("MAX_PARALLEL_INSERT", 2, int)
+    args.max_parallel_insert = get_env_value(
+        "MAX_PARALLEL_INSERT", DEFAULT_MAX_PARALLEL_INSERT, int
+    )
+
+    # Bounded scheduling page size (LR2 Phase 2); 0 disables paging.
+    args.pipeline_scheduling_page_size = get_env_value(
+        "PIPELINE_SCHEDULING_PAGE_SIZE", DEFAULT_PIPELINE_SCHEDULING_PAGE_SIZE, int
+    )
+
+    # Turn a missing strict doc_status capability into a startup failure instead
+    # of a warning + /health degradation report (LR2 §11).
+    args.pipeline_require_strict_storage_reads = get_env_value(
+        "PIPELINE_REQUIRE_STRICT_STORAGE_READS",
+        DEFAULT_PIPELINE_REQUIRE_STRICT_STORAGE_READS,
+        bool,
+    )
+
+    # How many newly claimed files one /documents/scan batch holds before
+    # writing them to doc_status (LR2 §8.2). Always positive — validated below.
+    args.scan_enqueue_batch_size = get_env_value(
+        "SCAN_ENQUEUE_BATCH_SIZE", DEFAULT_SCAN_ENQUEUE_BATCH_SIZE, int
+    )
+
+    # Where /documents/scan puts its disposable candidate spool, which holds the
+    # O(files-in-INPUT_DIR) ordering state that keeps scan memory bounded (LR2
+    # §8.2). Empty → WORKING_DIR/scan_spool. Set this when WORKING_DIR is a
+    # network volume, or when the OS temp dir is a RAM-backed tmpfs (the usual
+    # systemd default) — the point of the spool is to be on real disk.
+    args.scan_spool_dir = get_env_value("SCAN_SPOOL_DIR", "", str)
+
+    # Admission capacity for ordinary ingestion (LR2 §9.1); 0 disables it.
+    args.max_pending_documents = get_env_value(
+        "MAX_PENDING_DOCUMENTS", DEFAULT_MAX_PENDING_DOCUMENTS, int
+    )
+
+    # Raw request-body ceiling (LR2 §9.4); 0 disables. Whether the operator
+    # supplied a value is recorded separately and MUST NOT be inferred by
+    # comparing the value to the default: an explicit MAX_REQUEST_BODY_BYTES
+    # equal to DEFAULT_MAX_REQUEST_BODY_BYTES is indistinguishable that way, and
+    # resolve_body_limits() would then hand the text-ingestion routes the 50 MiB
+    # built-in tier instead of the ceiling the operator asked for. A None default
+    # also folds in an unparseable value: it falls back here, and falling back to
+    # the default value should mean falling back to the default tiering too.
+    _configured_body_limit = get_env_value("MAX_REQUEST_BODY_BYTES", None, int)
+    args.max_request_body_bytes_explicit = _configured_body_limit is not None
+    args.max_request_body_bytes = (
+        DEFAULT_MAX_REQUEST_BODY_BYTES
+        if _configured_body_limit is None
+        else _configured_body_limit
+    )
+
+    # Document fan-out ceiling for one /documents/texts request (LR2 §11); 0 disables.
+    args.max_texts_per_request = get_env_value(
+        "MAX_TEXTS_PER_REQUEST", DEFAULT_MAX_TEXTS_PER_REQUEST, int
+    )
 
     # Get MAX_GRAPH_NODES from environment
     args.max_graph_nodes = get_env_value("MAX_GRAPH_NODES", 1000, int)
@@ -447,6 +675,13 @@ def parse_args() -> argparse.Namespace:
     args.llm_binding_api_key = get_env_value("LLM_BINDING_API_KEY", None)
     args.embedding_binding_api_key = get_env_value("EMBEDDING_BINDING_API_KEY", "")
 
+    args.aws_region = get_env_value("AWS_REGION", None, special_none=True)
+    args.aws_access_key_id = get_env_value("AWS_ACCESS_KEY_ID", None, special_none=True)
+    args.aws_secret_access_key = get_env_value(
+        "AWS_SECRET_ACCESS_KEY", None, special_none=True
+    )
+    args.aws_session_token = get_env_value("AWS_SESSION_TOKEN", None, special_none=True)
+
     # Inject model configuration
     args.llm_model = get_env_value("LLM_MODEL", "mistral-nemo:latest")
     # EMBEDDING_MODEL defaults to None - each binding will use its own default model
@@ -460,28 +695,112 @@ def parse_args() -> argparse.Namespace:
     # Inject chunk configuration
     args.chunk_size = get_env_value("CHUNK_SIZE", 1200, int)
     args.chunk_overlap_size = get_env_value("CHUNK_OVERLAP_SIZE", 100, int)
+    # Embedding hard-fallback overlap — independent of chunk_overlap_size above,
+    # see LightRAG.embedding_chunk_overlap_token_size.
+    args.embedding_chunk_overlap_token_size = get_env_value(
+        "EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE",
+        DEFAULT_EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE,
+        int,
+    )
 
     # Inject LLM cache configuration
+    # Should not be disabled； LLM cache is required for entity/realtion rebuild after file deletion.
     args.enable_llm_cache_for_extract = get_env_value(
         "ENABLE_LLM_CACHE_FOR_EXTRACT", True, bool
     )
     args.enable_llm_cache = get_env_value("ENABLE_LLM_CACHE", True, bool)
 
-    # Set document_loading_engine from --docling flag
-    if args.docling:
-        args.document_loading_engine = "DOCLING"
-    else:
-        args.document_loading_engine = get_env_value(
-            "DOCUMENT_LOADING_ENGINE", "DEFAULT"
+    # --- Per-role LLM configuration (driven by lightrag.ROLES registry) ---
+    for spec in ROLES:
+        prefix = spec.env_prefix
+        attr_prefix = spec.name
+        binding_key = f"{prefix}_LLM_BINDING"
+        model_key = f"{prefix}_LLM_MODEL"
+        host_key = f"{prefix}_LLM_BINDING_HOST"
+        apikey_key = f"{prefix}_LLM_BINDING_API_KEY"
+        max_async_key = f"{prefix}_MAX_ASYNC_LLM"
+        timeout_key = f"{prefix}_LLM_TIMEOUT"
+
+        role_binding = normalize_binding_name(
+            get_env_value(binding_key, None, special_none=True)
+        )
+        role_model = get_env_value(model_key, None, special_none=True)
+        role_host = get_env_value(host_key, None, special_none=True)
+        role_apikey = get_env_value(apikey_key, None, special_none=True)
+        role_max_async = get_env_value(max_async_key, None, int, special_none=True)
+        role_timeout = get_env_value(timeout_key, None, int, special_none=True)
+        role_aws_region = get_env_value(f"{prefix}_AWS_REGION", None, special_none=True)
+        role_aws_access_key_id = get_env_value(
+            f"{prefix}_AWS_ACCESS_KEY_ID", None, special_none=True
+        )
+        role_aws_secret_access_key = get_env_value(
+            f"{prefix}_AWS_SECRET_ACCESS_KEY", None, special_none=True
+        )
+        role_aws_session_token = get_env_value(
+            f"{prefix}_AWS_SESSION_TOKEN", None, special_none=True
         )
 
-    # PDF decryption password
-    args.pdf_decrypt_password = get_env_value("PDF_DECRYPT_PASSWORD", None)
+        setattr(args, f"{attr_prefix}_llm_binding", role_binding)
+        setattr(args, f"{attr_prefix}_llm_model", role_model)
+        setattr(args, f"{attr_prefix}_llm_binding_host", role_host)
+        setattr(args, f"{attr_prefix}_llm_binding_api_key", role_apikey)
+        setattr(args, f"{attr_prefix}_llm_max_async", role_max_async)
+        setattr(args, f"{attr_prefix}_llm_timeout", role_timeout)
+        setattr(args, f"{attr_prefix}_aws_region", role_aws_region)
+        setattr(args, f"{attr_prefix}_aws_access_key_id", role_aws_access_key_id)
+        setattr(
+            args, f"{attr_prefix}_aws_secret_access_key", role_aws_secret_access_key
+        )
+        setattr(args, f"{attr_prefix}_aws_session_token", role_aws_session_token)
+
+        if role_binding == "bedrock" and role_apikey:
+            raise SystemExit(
+                f"Bedrock role '{spec.name}' does not support {apikey_key}; use "
+                "role-specific SigV4 AWS_* variables or process-level "
+                "AWS_BEARER_TOKEN_BEDROCK."
+            )
+
+        # Cross-provider validation
+        if role_binding and role_binding != args.llm_binding:
+            missing = []
+            if not role_model:
+                missing.append(model_key)
+            if not role_host:
+                role_host = get_default_host(role_binding)
+                setattr(args, f"{attr_prefix}_llm_binding_host", role_host)
+            if role_binding != "bedrock" and not role_apikey:
+                missing.append(apikey_key)
+            if missing:
+                raise SystemExit(
+                    f"Cross-provider error for role '{spec.name}': "
+                    f"binding={role_binding} differs from base={args.llm_binding}, "
+                    f"but required env vars are missing: {', '.join(missing)}"
+                )
+
+    # VLM multimodal master switch. It gates IMAGE (`i`) analysis only —
+    # table and equation items are analyzed by the EXTRACT role and ignore
+    # it. When off, a document carrying `i` does not skip its images: the
+    # first one that survives _analyze_drawing's pre-filters raises and the
+    # document lands in FAILED. When on, the effective VLM binding must
+    # accept image inputs; lollms is the only binding this server offers
+    # whose complete_if_cache rejects image_inputs outright.
+    args.vlm_process_enable = get_env_value("VLM_PROCESS_ENABLE", False, bool)
+    if args.vlm_process_enable:
+        effective_vlm_binding = (
+            getattr(args, "vlm_llm_binding", None) or args.llm_binding
+        )
+        vlm_incompatible = {"lollms"}
+        if effective_vlm_binding in vlm_incompatible:
+            raise SystemExit(
+                f"VLM_PROCESS_ENABLE=true but the effective VLM binding "
+                f"'{effective_vlm_binding}' does not support image inputs. "
+                "Configure VLM_LLM_BINDING (or LLM_BINDING) to one of: "
+                "openai, azure_openai, gemini, bedrock, ollama."
+            )
 
     # Add environment variables that were previously read directly
     args.cors_origins = get_env_value("CORS_ORIGINS", "*")
     args.summary_language = get_env_value("SUMMARY_LANGUAGE", DEFAULT_SUMMARY_LANGUAGE)
-    args.entity_types = get_env_value("ENTITY_TYPES", DEFAULT_ENTITY_TYPES, list)
     args.whitelist_paths = get_env_value("WHITELIST_PATHS", "/health,/api/*")
 
     # For JWT Auth
@@ -495,6 +814,14 @@ def parse_args() -> argparse.Namespace:
     args.token_auto_renew = get_env_value("TOKEN_AUTO_RENEW", True, bool)
     args.token_renew_threshold = get_env_value("TOKEN_RENEW_THRESHOLD", 0.5, float)
 
+    # Login brute-force protection: max failed /login attempts per client IP +
+    # username within the window before further attempts are rejected with HTTP
+    # 429. Set LOGIN_MAX_FAILED_ATTEMPTS=0 to disable (CWE-307).
+    args.login_max_failed_attempts = get_env_value("LOGIN_MAX_FAILED_ATTEMPTS", 5, int)
+    args.login_lockout_window_seconds = get_env_value(
+        "LOGIN_LOCKOUT_WINDOW_SECONDS", 300, float
+    )
+
     # Rerank model configuration
     args.rerank_model = get_env_value("RERANK_MODEL", None)
     args.rerank_binding_host = get_env_value("RERANK_BINDING_HOST", None)
@@ -506,8 +833,18 @@ def parse_args() -> argparse.Namespace:
         "MIN_RERANK_SCORE", DEFAULT_MIN_RERANK_SCORE, float
     )
 
+    # LLM / Embedding request timeouts
+    args.llm_timeout = get_env_value("LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT, int)
+    args.embedding_timeout = get_env_value(
+        "EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT, int
+    )
+
+    # Rerank async/timeout configuration (independent from base LLM)
+    # rerank_max_async falls back to MAX_ASYNC_LLM; rerank_timeout has its own default.
+    args.rerank_max_async = get_env_value("MAX_ASYNC_RERANK", args.max_async, int)
+    args.rerank_timeout = get_env_value("RERANK_TIMEOUT", DEFAULT_RERANK_TIMEOUT, int)
+
     # Query configuration
-    args.history_turns = get_env_value("HISTORY_TURNS", DEFAULT_HISTORY_TURNS, int)
     args.top_k = get_env_value("TOP_K", DEFAULT_TOP_K, int)
     args.chunk_top_k = get_env_value("CHUNK_TOP_K", DEFAULT_CHUNK_TOP_K, int)
     args.max_entity_tokens = get_env_value(
@@ -582,6 +919,7 @@ def parse_args() -> argparse.Namespace:
             args.workspace = sanitized
 
     validate_auth_configuration(args)
+    validate_bedrock_auth_configuration(args)
     return args
 
 
@@ -635,6 +973,9 @@ def initialize_config(args=None, force=False):
 
     resolved_args = args if args is not None else parse_args()
     validate_auth_configuration(resolved_args)
+    validate_bedrock_auth_configuration(resolved_args)
+    validate_scan_batch_configuration(resolved_args)
+    validate_admission_configuration(resolved_args)
     _global_args = resolved_args
     _initialized = True
     return _global_args

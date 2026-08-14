@@ -10,6 +10,7 @@ implementation mirrors the OpenAI helpers while relying on the official
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Any
@@ -22,7 +23,11 @@ from tenacity import (
     retry_if_exception_type,
 )
 
+from lightrag.exceptions import EmptyTruncatedResponseError
 from lightrag.utils import (
+    TruncatedResponse,
+    empty_length_truncated_hint,
+    format_response_diagnostics,
     logger,
     remove_think_tags,
     safe_unicode_decode,
@@ -48,6 +53,33 @@ class InvalidResponseError(Exception):
     pass
 
 
+_DEFAULT_GEMINI_BASE_URLS = {
+    "https://generativelanguage.googleapis.com",
+    "https://generativelanguage.googleapis.com/",
+    "https://generativelanguage.googleapis.com/v1beta",
+    "https://generativelanguage.googleapis.com/v1beta/",
+    "https://generativelanguage.googleapis.com/v1",
+    "https://generativelanguage.googleapis.com/v1/",
+}
+
+
+def _normalize_gemini_base_url(base_url: str | None) -> str | None:
+    """Treat Google's default Gemini API service roots as SDK defaults."""
+    if not base_url:
+        return None
+
+    normalized = base_url.strip()
+    if not normalized or normalized == "DEFAULT_GEMINI_ENDPOINT":
+        return None
+
+    if normalized.rstrip("/") in {
+        service_root.rstrip("/") for service_root in _DEFAULT_GEMINI_BASE_URLS
+    }:
+        return None
+
+    return normalized
+
+
 @lru_cache(maxsize=8)
 def _get_gemini_client(
     api_key: str, base_url: str | None, timeout: int | None = None
@@ -64,6 +96,7 @@ def _get_gemini_client(
         genai.Client: Configured Gemini client instance.
     """
     client_kwargs: dict[str, Any] = {}
+    normalized_base_url = _normalize_gemini_base_url(base_url)
 
     # Add Vertex AI support
     use_vertexai = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
@@ -84,11 +117,11 @@ def _get_gemini_client(
         # Standard Gemini API mode: use api_key
         client_kwargs["api_key"] = api_key
 
-    if base_url and base_url != "DEFAULT_GEMINI_ENDPOINT" or timeout is not None:
+    if normalized_base_url is not None or timeout is not None:
         try:
             http_options_kwargs = {}
-            if base_url and base_url != "DEFAULT_GEMINI_ENDPOINT":
-                http_options_kwargs["base_url"] = base_url
+            if normalized_base_url is not None:
+                http_options_kwargs["base_url"] = normalized_base_url
             if timeout is not None:
                 http_options_kwargs["timeout"] = timeout
 
@@ -119,7 +152,7 @@ def _ensure_api_key(api_key: str | None) -> str:
 def _build_generation_config(
     base_config: dict[str, Any] | None,
     system_prompt: str | None,
-    keyword_extraction: bool,
+    response_format: Any | None,
 ) -> types.GenerateContentConfig | None:
     config_data = dict(base_config or {})
 
@@ -131,8 +164,12 @@ def _build_generation_config(
         else:
             config_data["system_instruction"] = system_prompt
 
-    if keyword_extraction and not config_data.get("response_mime_type"):
-        config_data["response_mime_type"] = "application/json"
+    # Translate response_format to Gemini's native generation config fields.
+    if response_format is not None:
+        config_data.setdefault("response_mime_type", "application/json")
+        schema = _normalize_gemini_response_schema(response_format)
+        if schema is not None and "response_json_schema" not in config_data:
+            config_data["response_json_schema"] = schema
 
     # Remove entries that are explicitly set to None to avoid type errors
     sanitized = {
@@ -145,6 +182,39 @@ def _build_generation_config(
         return None
 
     return types.GenerateContentConfig(**sanitized)
+
+
+def _normalize_gemini_response_schema(response_format: Any) -> Any | None:
+    """Extract a Gemini-compatible JSON schema from LightRAG/OpenAI inputs."""
+    if response_format is None:
+        return None
+
+    if isinstance(response_format, dict):
+        if response_format.get("type") == "json_object":
+            return None
+
+        if response_format.get("type") == "json_schema":
+            json_schema = response_format.get("json_schema")
+            if isinstance(json_schema, dict):
+                schema = json_schema.get("schema")
+                if isinstance(schema, dict):
+                    return schema
+                return json_schema
+
+        return response_format
+
+    return response_format
+
+
+def _validate_gemini_response_format(response_format: Any | None) -> None:
+    """Reject typed structured-output helpers; only dict payloads are supported."""
+    if response_format is None or isinstance(response_format, dict):
+        return
+
+    raise TypeError(
+        "gemini_complete_if_cache only supports dict response_format payloads; "
+        "typed/Pydantic response_format values are not supported."
+    )
 
 
 def _format_history_messages(history_messages: list[dict[str, Any]] | None) -> str:
@@ -225,9 +295,12 @@ async def gemini_complete_if_cache(
     api_key: str | None = None,
     token_tracker: Any | None = None,
     stream: bool | None = None,
+    response_format: Any | None = None,
     keyword_extraction: bool = False,
+    entity_extraction: bool = False,
     generation_config: dict[str, Any] | None = None,
     timeout: int | None = None,
+    image_inputs: list[Any] | None = None,
     **_: Any,
 ) -> str | AsyncIterator[str]:
     """
@@ -235,6 +308,19 @@ async def gemini_complete_if_cache(
 
     This function supports automatic integration of reasoning content from Gemini models
     that provide Chain of Thought capabilities via the thinking_config API feature.
+
+    Structured output note:
+    - This adapter accepts OpenAI-style ``response_format`` and translates it
+      to Gemini's native generation config fields.
+    - ``response_format={"type": "json_object"}`` maps to
+      ``response_mime_type="application/json"``.
+    - Dict-form ``json_schema`` payloads map to
+      ``response_mime_type="application/json"`` plus
+      ``response_json_schema=<schema>``.
+    - Typed/Pydantic ``response_format`` helpers are rejected explicitly.
+    - Deprecated ``keyword_extraction`` and ``entity_extraction`` booleans are
+      compatibility shims; when no explicit ``response_format`` is supplied,
+      they are mapped to ``{"type": "json_object"}``.
 
     COT Integration:
     - When enable_cot=True: Thought content is wrapped in <think>...</think> tags
@@ -250,7 +336,11 @@ async def gemini_complete_if_cache(
         api_key: Optional Gemini API key. If None, uses environment variable.
         base_url: Optional custom API endpoint.
         generation_config: Optional generation configuration dict.
-        keyword_extraction: Whether to use JSON response format.
+        response_format: OpenAI-style structured output control translated to
+            Gemini generation config. ``{"type": "json_object"}`` maps to
+            ``response_mime_type="application/json"``; dict-form
+            ``json_schema`` payloads map to ``response_json_schema``.
+            Typed/Pydantic response_format values are rejected.
         token_tracker: Optional token usage tracker for monitoring API usage.
         stream: Whether to stream the response.
         hashing_kv: Storage interface (for interface parity with other bindings).
@@ -271,6 +361,29 @@ async def gemini_complete_if_cache(
     timeout_ms = timeout * 1000 if timeout else None
     client = _get_gemini_client(key, base_url, timeout_ms)
 
+    # Deprecation shims: map legacy boolean flags to response_format only when
+    # an explicit response_format was not supplied.
+    if response_format is None:
+        if entity_extraction:
+            warnings.warn(
+                "gemini_complete_if_cache(entity_extraction=True) is deprecated; "
+                "pass response_format={'type': 'json_object'} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            response_format = {"type": "json_object"}
+        elif keyword_extraction:
+            warnings.warn(
+                "gemini_complete_if_cache(keyword_extraction=True) is deprecated; "
+                "pass response_format={'type': 'json_object'} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            response_format = {"type": "json_object"}
+    _validate_gemini_response_format(response_format)
+    if response_format is not None:
+        enable_cot = False
+
     history_block = _format_history_messages(history_messages)
     prompt_sections = []
     if history_block:
@@ -281,12 +394,25 @@ async def gemini_complete_if_cache(
     config_obj = _build_generation_config(
         generation_config,
         system_prompt=system_prompt,
-        keyword_extraction=keyword_extraction,
+        response_format=response_format,
     )
+
+    if image_inputs:
+        from lightrag.llm._vision_utils import normalize_image_inputs
+
+        normalized_images = normalize_image_inputs(image_inputs)
+        parts: list[Any] = [combined_prompt]
+        parts.extend(
+            types.Part.from_bytes(data=img.raw_bytes, mime_type=img.mime_type)
+            for img in normalized_images
+        )
+        contents: list[Any] = [parts]
+    else:
+        contents = [combined_prompt]
 
     request_kwargs: dict[str, Any] = {
         "model": model,
-        "contents": [combined_prompt],
+        "contents": contents,
     }
     if config_obj is not None:
         request_kwargs["config"] = config_obj
@@ -303,10 +429,10 @@ async def gemini_complete_if_cache(
             try:
                 # Use native async streaming from genai SDK
                 # Note: generate_content_stream returns Awaitable[AsyncIterator], need to await first
-                stream = await client.aio.models.generate_content_stream(
+                stream_iter = await client.aio.models.generate_content_stream(
                     **request_kwargs
                 )
-                async for chunk in stream:
+                async for chunk in stream_iter:
                     usage = getattr(chunk, "usage_metadata", None)
                     if usage is not None:
                         usage_metadata = usage
@@ -363,14 +489,14 @@ async def gemini_complete_if_cache(
                     yield "</think>"
                     cot_active = False
 
-            except Exception as exc:
+            except Exception:
                 # Try to close COT tag before re-raising
                 if cot_active:
                     try:
                         yield "</think>"
                     except Exception:
                         pass
-                raise exc
+                raise
             finally:
                 # Track token usage after streaming completes
                 if token_tracker and usage_metadata:
@@ -413,14 +539,17 @@ async def gemini_complete_if_cache(
         # Filter out thought content, return only regular content
         final_text = regular_text or ""
 
-    if not final_text:
-        raise InvalidResponseError("Gemini response did not contain any text content.")
+    candidates = getattr(response, "candidates", None)
+    finish_reason = (
+        getattr(candidates[0], "finish_reason", None) if candidates else None
+    )
+    length_limited = finish_reason == types.FinishReason.MAX_TOKENS
 
-    if "\\u" in final_text:
-        final_text = safe_unicode_decode(final_text.encode("utf-8"))
-
-    final_text = remove_think_tags(final_text)
-
+    # Count usage BEFORE the empty-response validation below: the request
+    # consumed its budget whether or not the response is usable — a thinking
+    # model that burned the whole output budget on its reasoning trace is
+    # exactly the case that raises, and omitting it would under-report by a
+    # full-budget generation. The streaming path already tracks in a finally.
     usage = getattr(response, "usage_metadata", None)
     if token_tracker and usage:
         token_tracker.add_usage(
@@ -431,6 +560,79 @@ async def gemini_complete_if_cache(
             }
         )
 
+    def _empty_response_error(thought_len: int) -> Exception:
+        """Diagnose an empty Gemini response the way the OpenAI binding does.
+
+        The exception TYPE selects the retry policy: token-limit exhaustion is
+        deterministic for a given prompt and output budget, so it returns
+        ``EmptyTruncatedResponseError`` — absent from the retry predicate —
+        and fails after ONE request instead of buying two more full-budget
+        generations plus backoff. Every other empty response keeps the
+        retryable ``InvalidResponseError``: those are sampling artifacts a
+        fresh attempt can genuinely fix.
+        """
+        usage_metadata = getattr(response, "usage_metadata", None)
+        diagnostics = format_response_diagnostics(
+            finish_reason=getattr(finish_reason, "name", finish_reason),
+            candidates_token_count=getattr(
+                usage_metadata, "candidates_token_count", None
+            ),
+            thoughts_token_count=getattr(usage_metadata, "thoughts_token_count", None),
+            thought_len=thought_len,
+        )
+        if length_limited:
+            hint = empty_length_truncated_hint(
+                "consider raising GEMINI_LLM_MAX_OUTPUT_TOKENS or disabling "
+                "thinking mode",
+                reasoning_consumed_budget=bool(thought_len),
+            )
+        elif thought_len:
+            hint = (
+                "model returned reasoning-only output (thoughts are stripped "
+                "on this path); consider disabling thinking mode for this role"
+            )
+        else:
+            hint = "model produced no output"
+        message = f"Received empty content from Gemini API ({diagnostics}): {hint}"
+        logger.error(message)
+        if length_limited:
+            return EmptyTruncatedResponseError(message)
+        return InvalidResponseError(message)
+
+    if not final_text:
+        raise _empty_response_error(len((thought_text or "").strip()))
+
+    if "\\u" in final_text:
+        final_text = safe_unicode_decode(final_text.encode("utf-8"))
+
+    final_text = remove_think_tags(final_text)
+
+    # A thinking model that spent its whole budget on the reasoning trace
+    # reaches here with final_text == "<think>...</think>", which the line
+    # above strips to nothing: empty AFTER sanitization is the same broken
+    # response as empty before it, and used to be returned as a successful
+    # (if truncated) empty string. Only escalated for the token-limit case,
+    # which is deterministic and actionable; a reasoning-only response that
+    # ended normally keeps its previous behavior with a warning.
+    if not final_text.strip():
+        if length_limited:
+            raise _empty_response_error(len((thought_text or "").strip()))
+        logger.warning(
+            "Gemini response contained only reasoning content "
+            f"(finish_reason={getattr(finish_reason, 'name', finish_reason)}), "
+            "returning empty content"
+        )
+
+    # Flag token-limit truncation so the cache layer skips persisting partial
+    # output. Must stay the last transformation of final_text: any later
+    # string operation would rebuild a plain str and drop the marker.
+    if length_limited:
+        logger.warning(
+            "Gemini response truncated by token limit "
+            f"(finish_reason=MAX_TOKENS, content_len={len(final_text)}), returning partial content"
+        )
+        final_text = TruncatedResponse(final_text)
+
     logger.debug("Gemini response length: %s", len(final_text))
     return final_text
 
@@ -439,9 +641,13 @@ async def gemini_model_complete(
     prompt: str,
     system_prompt: str | None = None,
     history_messages: list[dict[str, Any]] | None = None,
+    response_format: Any | None = None,
     keyword_extraction: bool = False,
+    entity_extraction: bool = False,
     **kwargs: Any,
 ) -> str | AsyncIterator[str]:
+    # Accept legacy keyword if passed via kwargs to preserve backwards compat.
+    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     hashing_kv = kwargs.get("hashing_kv")
     model_name = None
     if hashing_kv is not None:
@@ -456,7 +662,9 @@ async def gemini_model_complete(
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
+        response_format=response_format,
         keyword_extraction=keyword_extraction,
+        entity_extraction=entity_extraction,
         **kwargs,
     )
 

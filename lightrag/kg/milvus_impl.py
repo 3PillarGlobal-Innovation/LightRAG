@@ -1,24 +1,157 @@
 import asyncio
+import json
 import os
+import time
 from typing import Any, final, Optional, Dict
 from dataclasses import dataclass, fields
 import numpy as np
-from lightrag.utils import logger, compute_mdhash_id
+from lightrag.utils import (
+    logger,
+    compute_mdhash_id,
+    _cooperative_yield,
+    validate_workspace,
+)
 from ..base import BaseVectorStorage
-from ..constants import DEFAULT_MAX_FILE_PATH_LENGTH
-from ..kg.shared_storage import get_data_init_lock
+from ..constants import (
+    DEFAULT_MAX_FILE_PATH_LENGTH,
+    DEFAULT_QUERY_PRIORITY,
+    GRAPH_FIELD_SEP,
+)
+from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 import pipmaster as pm
 
 if not pm.is_installed("pymilvus"):
     pm.install("pymilvus>=2.6.2")
 
 import configparser
-from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema  # type: ignore
+import grpc  # type: ignore
+from pymilvus import (  # type: ignore
+    MilvusClient,
+    MilvusException,
+    DataType,
+    CollectionSchema,
+    FieldSchema,
+)
 from packaging import version
 
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
 
+
+@dataclass
+class _PendingVectorDoc:
+    """Buffered vector upsert waiting for embedding and/or bulk flush."""
+
+    source: dict[str, Any]
+    content: str
+    vector: list[float] | None = None
+
+
+# Flush-time batching limits. Milvus' server-side proxy rejects any single
+# gRPC message larger than ~64MB (grpc.serverMaxRecvSize); the client library
+# cannot raise that ceiling, so large flushes must be split client-side.
+# The payload-byte budget is the primary limiter; the record-count caps are a
+# secondary guard that only binds when individual records are small.
+# Upsert and delete have separate count caps on purpose: upsert records each
+# carry a full embedding vector and are far heavier than delete pks, so the
+# upsert batch count is kept much smaller than the delete one.
+DEFAULT_MILVUS_UPSERT_MAX_PAYLOAD_BYTES = (
+    32 * 1024 * 1024
+)  # 32MB, well below the 64MB gRPC ceiling
+DEFAULT_MILVUS_UPSERT_MAX_RECORDS_PER_BATCH = 128
+DEFAULT_MILVUS_DELETE_MAX_RECORDS_PER_BATCH = 1000
+
+# Read-path response-size ceiling (issue #3584). Unlike the write path above,
+# a query() response that crosses the gRPC message ceiling isn't rejected by
+# self-hosted Milvus's much larger ~64MB limit — it's rejected by the ~4MB
+# gRPC default that managed gateways (e.g. Zilliz Cloud) enforce and don't
+# expose a way to raise. 2MB keeps a 2x margin under that 4MB ceiling.
+MILVUS_QUERY_MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2MB
+MILVUS_QUERY_MAX_RECORDS_PER_BATCH = 256
+MILVUS_QUERY_ROW_OVERHEAD_BYTES = 256
+
+# Substrings that mark a query() failure as "the response was too large"
+# rather than a connection or parameter error. Metadata rows carry no
+# estimable size (`content` and `source_id` are each capped only by
+# MILVUS_MAX_VARCHAR_BYTES), so the record cap above cannot be a byte-level
+# guarantee for them; a page that still overflows is bisected and retried
+# instead of failing the whole read. Deriving the metadata page size from
+# those schema limits statically would instead assume ~200KB per row and
+# shrink every page to ~10 ids, inflating the common case (multi-KB
+# `content`) by roughly an order of magnitude for an overflow that is rare.
+#
+# Matched on the message text only, never on the gRPC RESOURCE_EXHAUSTED
+# status: that status also covers per-user quota (grpc's own docs say so), and
+# a rate-limited call bisected into ~log2(page_size) immediate no-backoff
+# retries would amplify the throttling it misread. The status buys no recall
+# either — grpc-core always attaches this text to a genuine oversize response
+# (see the traceback in issue #3584) — so quota errors fail fast instead.
+MILVUS_QUERY_RESPONSE_TOO_LARGE_MARKERS = ("received message larger than max",)
+
+# Schema-migration resilience. A transient Milvus outage during the long
+# iterator-based migration must not kill worker startup: when pymilvus'
+# internal reconnect fails it closes the gRPC channel for good, so every later
+# call on the same client raises "Cannot invoke RPC on closed channel!". On a
+# connection-class failure the whole migration attempt is therefore retried
+# from scratch with a rebuilt MilvusClient (the source collection is untouched
+# until the final rename and each attempt drops the leftover _temp collection
+# first, so a full re-run is always safe). The max backoff is kept above
+# pymilvus' connection-pool idle health-check threshold (IDLE_THRESHOLD_SECONDS
+# = 30s in pymilvus 3.x) so a rebuilt client is guaranteed to get a
+# health-checked/recovered channel rather than the same dead pooled handler.
+DEFAULT_MILVUS_MIGRATION_MAX_RETRIES = 5
+DEFAULT_MILVUS_MIGRATION_RETRY_BACKOFF_SECONDS = 5.0
+DEFAULT_MILVUS_MIGRATION_RETRY_MAX_BACKOFF_SECONDS = 60.0
+MILVUS_MIGRATION_RETRY_BACKOFF_MULTIPLIER = 3.0
+DEFAULT_MILVUS_MIGRATION_ITERATOR_BATCH_SIZE = 2000
+
+# Schema-migration memory back-pressure. The bulk copy inserts the whole source
+# collection into the temp collection with no client-side throttle, so the
+# Milvus data node accumulates growing insert-buffer segments until its own
+# auto-flush catches up; under a large migration this can exhaust server memory
+# (the temp collection is not loaded, so query-node memory is already bounded —
+# this is the data-node write buffer). Flushing every N migrated rows seals
+# those segments to object storage and blocks until the flush returns, giving
+# the server natural back-pressure. 0 disables periodic flush (rely on Milvus
+# auto-flush). The interval is kept coarse so it does not spawn many tiny
+# segments (which would burden later compaction). An optional per-batch sleep
+# lets a small server breathe between batches; 0 disables it.
+DEFAULT_MILVUS_MIGRATION_FLUSH_INTERVAL_ROWS = 50000
+DEFAULT_MILVUS_MIGRATION_BATCH_SLEEP_SECONDS = 0.0
+
+# Substrings that mark an exception as a transient connection failure (worth a
+# retry with a rebuilt client) rather than a schema/parameter error.
+MILVUS_RETRYABLE_CONNECTION_ERROR_MARKERS = (
+    "unavailable",  # grpc UNAVAILABLE / "server unavailable"
+    "ping timeout",
+    "deadline exceeded",
+    "connection refused",
+    "connection reset",
+    "broken pipe",
+    "closed channel",  # ValueError: Cannot invoke RPC on closed channel!
+    "fail connecting to server",  # pymilvus _wait_for_channel_ready
+    "failed to connect",
+)
+
+MILVUS_MAX_VARCHAR_BYTES = 65535
+# The Milvus primary key. Truncating it would let two distinct ids collapse to
+# the same key (silent overwrite) and make the row unreachable by its real id
+# via get_by_id/delete, so it must never be truncated under any circumstance.
+MILVUS_PRIMARY_KEY_FIELDS = frozenset({"id"})
+# Non-primary identity fields. They are not the Milvus primary key, so the row
+# stays uniquely keyed by `id` even if these collide after truncation (no
+# storage-level overwrite). On the live upsert path we still reject oversize
+# values so callers fix their input; during migration of pre-existing data we
+# truncate-and-warn instead, so a single pathological legacy value cannot abort
+# the whole collection migration.
+MILVUS_IDENTITY_VARCHAR_FIELDS = frozenset(
+    {"id", "entity_name", "full_doc_id", "src_id", "tgt_id"}
+)
+# Fields whose value is a GRAPH_FIELD_SEP-joined list of ids (chunk ids / file
+# paths). When such a value overflows we truncate on the last separator that
+# fits rather than mid-id, so we drop whole ids instead of leaving a dangling
+# partial id that resolves to nothing.
+MILVUS_SEPARATOR_JOINED_FIELDS = frozenset({"source_id", "file_path"})
 
 # Supported index types
 SUPPORTED_INDEX_TYPES = {
@@ -69,6 +202,17 @@ def _get_env_int(key: str, default: int) -> int:
                 f"Invalid integer value for {key}: {val}, using default {default}"
             )
     return default
+
+
+def _escape_milvus_str(val: str) -> str:
+    """Escape a value embedded in a double-quoted Milvus filter literal."""
+    return (
+        val.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 
 @dataclass
@@ -404,11 +548,71 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         return MilvusClient(**self._get_milvus_connection_kwargs(include_db_name=True))
 
+    def _rebuild_milvus_client(self) -> None:
+        """Replace the (possibly dead) client with a freshly created one.
+
+        Once pymilvus' internal reconnect has failed, the gRPC channel is
+        closed permanently and every later RPC on the same client raises
+        "Cannot invoke RPC on closed channel!" — the client cannot heal
+        itself, so migration retries must rebuild it. Safe during migration:
+        it runs inside get_data_init_lock(), so this instance owns
+        self._client exclusively. close() is best-effort — on a dead channel
+        it is a no-op release. In pymilvus 3.x the pooled handler is
+        health-checked and recovered in place, which also heals other clients
+        sharing the same address.
+        """
+        old_client, self._client = self._client, None
+        if old_client is not None:
+            try:
+                old_client.close()
+            except Exception as close_error:
+                logger.warning(
+                    f"[{self.workspace}] Failed to close stale Milvus client: {close_error}"
+                )
+        self._client = self._create_milvus_client()
+
+    @staticmethod
+    def _is_retryable_connection_error(error: BaseException) -> bool:
+        """Return True when the error chain indicates a transient connection failure.
+
+        Walks __cause__/__context__ because the migration wraps low-level
+        errors in RuntimeError and pymilvus wraps grpc errors in
+        MilvusException. Schema, dimension and parameter errors fall through
+        to False so they keep failing fast.
+        """
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, grpc.RpcError):
+                code_getter = getattr(current, "code", None)
+                code = code_getter() if callable(code_getter) else None
+                if code in (
+                    grpc.StatusCode.UNAVAILABLE,
+                    grpc.StatusCode.DEADLINE_EXCEEDED,
+                ):
+                    return True
+            elif isinstance(current, MilvusException):
+                # Status.CONNECT_FAILED == 2 (client-side connect failure)
+                message = str(current).lower()
+                if current.code == 2 or any(
+                    marker in message
+                    for marker in MILVUS_RETRYABLE_CONNECTION_ERROR_MARKERS
+                ):
+                    return True
+            elif isinstance(current, ValueError):
+                # grpc raises ValueError("Cannot invoke RPC on closed channel!")
+                if "closed channel" in str(current).lower():
+                    return True
+            current = current.__cause__ or current.__context__
+        return False
+
     def _create_schema_for_namespace(self) -> CollectionSchema:
         """Create schema based on the current instance's namespace"""
 
         # Get vector dimension from embedding_func
         dimension = self.embedding_func.embedding_dim
+        varchar_limits = self._get_varchar_field_limits_for_namespace()
 
         # Base fields (common to all collections)
         base_fields = [
@@ -425,13 +629,25 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 FieldSchema(
                     name="entity_name",
                     dtype=DataType.VARCHAR,
-                    max_length=512,
+                    max_length=varchar_limits["entity_name"],
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="content",
+                    dtype=DataType.VARCHAR,
+                    max_length=varchar_limits["content"],
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="source_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=varchar_limits["source_id"],
                     nullable=True,
                 ),
                 FieldSchema(
                     name="file_path",
                     dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
+                    max_length=varchar_limits["file_path"],
                     nullable=True,
                 ),
             ]
@@ -440,15 +656,33 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         elif self.namespace.endswith("relationships"):
             specific_fields = [
                 FieldSchema(
-                    name="src_id", dtype=DataType.VARCHAR, max_length=512, nullable=True
+                    name="src_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=varchar_limits["src_id"],
+                    nullable=True,
                 ),
                 FieldSchema(
-                    name="tgt_id", dtype=DataType.VARCHAR, max_length=512, nullable=True
+                    name="tgt_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=varchar_limits["tgt_id"],
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="content",
+                    dtype=DataType.VARCHAR,
+                    max_length=varchar_limits["content"],
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="source_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=varchar_limits["source_id"],
+                    nullable=True,
                 ),
                 FieldSchema(
                     name="file_path",
                     dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
+                    max_length=varchar_limits["file_path"],
                     nullable=True,
                 ),
             ]
@@ -459,13 +693,19 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 FieldSchema(
                     name="full_doc_id",
                     dtype=DataType.VARCHAR,
-                    max_length=64,
+                    max_length=varchar_limits["full_doc_id"],
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="content",
+                    dtype=DataType.VARCHAR,
+                    max_length=varchar_limits["content"],
                     nullable=True,
                 ),
                 FieldSchema(
                     name="file_path",
                     dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
+                    max_length=varchar_limits["file_path"],
                     nullable=True,
                 ),
             ]
@@ -477,7 +717,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 FieldSchema(
                     name="file_path",
                     dtype=DataType.VARCHAR,
-                    max_length=DEFAULT_MAX_FILE_PATH_LENGTH,
+                    max_length=varchar_limits["file_path"],
                     nullable=True,
                 ),
             ]
@@ -491,6 +731,138 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             description=description,
             enable_dynamic_field=True,  # Support dynamic fields
         )
+
+    def _get_varchar_field_limits_for_namespace(self) -> dict[str, int]:
+        base_fields = {
+            "id": 64,
+            "content": MILVUS_MAX_VARCHAR_BYTES,
+            "file_path": DEFAULT_MAX_FILE_PATH_LENGTH,
+        }
+        if self.namespace.endswith("entities"):
+            return {
+                **base_fields,
+                "entity_name": 512,
+                "source_id": MILVUS_MAX_VARCHAR_BYTES,
+            }
+        if self.namespace.endswith("relationships"):
+            return {
+                **base_fields,
+                "src_id": 512,
+                "tgt_id": 512,
+                "source_id": MILVUS_MAX_VARCHAR_BYTES,
+            }
+        if self.namespace.endswith("chunks"):
+            return {**base_fields, "full_doc_id": 64}
+        return base_fields
+
+    def _get_migrated_metadata_field_limits(self) -> dict[str, int]:
+        if self.namespace.endswith("entities"):
+            return {
+                "content": MILVUS_MAX_VARCHAR_BYTES,
+                "source_id": MILVUS_MAX_VARCHAR_BYTES,
+            }
+        if self.namespace.endswith("relationships"):
+            return {
+                "content": MILVUS_MAX_VARCHAR_BYTES,
+                "source_id": MILVUS_MAX_VARCHAR_BYTES,
+            }
+        if self.namespace.endswith("chunks"):
+            return {"content": MILVUS_MAX_VARCHAR_BYTES}
+        return {}
+
+    @staticmethod
+    def _field_max_length(field: dict) -> int | None:
+        max_length = field.get("params", {}).get("max_length")
+        if max_length is None:
+            return None
+        try:
+            return int(max_length)
+        except (TypeError, ValueError):
+            return None
+
+    def _truncate_varchar_value(
+        self,
+        field_name: str,
+        value: Any,
+        record_id: str | None = None,
+        allow_identity_truncation: bool = False,
+    ) -> Any:
+        limit = self._varchar_field_limits.get(field_name)
+        if limit is None or not isinstance(value, str):
+            return value
+
+        encoded = value.encode("utf-8")
+        if len(encoded) <= limit:
+            return value
+
+        # The primary key is never truncated: collapsing two ids into one would
+        # silently overwrite a row and orphan it from get_by_id/delete.
+        if field_name in MILVUS_PRIMARY_KEY_FIELDS:
+            raise ValueError(
+                f"[{self.workspace}] Milvus primary key '{field_name}' for record "
+                f"'{record_id or '<unknown>'}' exceeds {limit} bytes "
+                f"({len(encoded)} bytes); primary keys cannot be truncated"
+            )
+
+        # Other identity fields: reject on the live upsert path, but allow
+        # truncate-and-warn during migration so legacy data can be carried over
+        # without aborting the whole collection.
+        if (
+            field_name in MILVUS_IDENTITY_VARCHAR_FIELDS
+            and not allow_identity_truncation
+        ):
+            raise ValueError(
+                f"[{self.workspace}] Milvus field '{field_name}' for record "
+                f"'{record_id or '<unknown>'}' exceeds {limit} bytes "
+                f"({len(encoded)} bytes); identity fields cannot be truncated"
+            )
+
+        # Cut to the byte budget on a valid UTF-8 boundary first.
+        truncated = encoded[:limit].decode("utf-8", errors="ignore")
+        # For separator-joined id lists, back off to the last separator that
+        # fits so we never persist a half id. Fall back to the raw byte cut when
+        # no separator fits (e.g. a single id longer than the limit).
+        if field_name in MILVUS_SEPARATOR_JOINED_FIELDS:
+            boundary = truncated.rfind(GRAPH_FIELD_SEP)
+            if boundary > 0:
+                truncated = truncated[:boundary]
+        logger.warning(
+            "[%s] Milvus field '%s' for record '%s' truncated from %d to %d bytes",
+            self.workspace,
+            field_name,
+            record_id or "<unknown>",
+            len(encoded),
+            len(truncated.encode("utf-8")),
+        )
+        return truncated
+
+    def _sanitize_varchar_fields(
+        self, row: dict[str, Any], allow_identity_truncation: bool = False
+    ) -> dict[str, Any]:
+        record_id = str(row.get("id", "")) or None
+        return {
+            field_name: self._truncate_varchar_value(
+                field_name,
+                value,
+                record_id,
+                allow_identity_truncation=allow_identity_truncation,
+            )
+            for field_name, value in row.items()
+        }
+
+    def _normalize_migration_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        metadata = normalized.pop("$meta", None)
+        if isinstance(metadata, dict):
+            for field_name, value in metadata.items():
+                # Explicit nullable fields can hold None while the real value
+                # still lives in $meta (schema-drift rows), so backfill on None
+                # rather than mere key presence.
+                if normalized.get(field_name) is None:
+                    normalized[field_name] = value
+        # Migration carries pre-existing rows: non-primary identity fields are
+        # truncated-and-warned rather than rejected (see _truncate_varchar_value).
+        return self._sanitize_varchar_fields(normalized, allow_identity_truncation=True)
 
     def _get_index_params(self):
         """Get IndexParams in a version-compatible way"""
@@ -693,17 +1065,22 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         if self.namespace.endswith("entities"):
             specific_fields = {
                 "entity_name": {"type": "VarChar"},
+                "content": {"type": "VarChar"},
+                "source_id": {"type": "VarChar"},
                 "file_path": {"type": "VarChar"},
             }
         elif self.namespace.endswith("relationships"):
             specific_fields = {
                 "src_id": {"type": "VarChar"},
                 "tgt_id": {"type": "VarChar"},
+                "content": {"type": "VarChar"},
+                "source_id": {"type": "VarChar"},
                 "file_path": {"type": "VarChar"},
             }
         elif self.namespace.endswith("chunks"):
             specific_fields = {
                 "full_doc_id": {"type": "VarChar"},
+                "content": {"type": "VarChar"},
                 "file_path": {"type": "VarChar"},
             }
         else:
@@ -872,6 +1249,19 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         )
         return
 
+    @staticmethod
+    def _has_vector_field(collection_info: dict) -> bool:
+        """Return True when the collection exposes a 'vector' field.
+
+        Old simple-schema collections may lack a vector field entirely. Their
+        rows therefore carry no vector data, and copying them into the new
+        schema (whose vector field is required) would fail at insert time, so
+        callers use this to skip migration for such collections.
+        """
+        return any(
+            field.get("name") == "vector" for field in collection_info.get("fields", [])
+        )
+
     def _check_file_path_length_restriction(self, collection_info: dict) -> bool:
         """Check if collection has file_path length restrictions that need migration
 
@@ -897,6 +1287,38 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         return False
 
+    def _check_metadata_schema_migration_needed(self, collection_info: dict) -> bool:
+        existing_fields = {
+            field["name"]: field for field in collection_info.get("fields", [])
+        }
+
+        for (
+            field_name,
+            expected_max_length,
+        ) in self._get_migrated_metadata_field_limits().items():
+            existing_field = existing_fields.get(field_name)
+            if existing_field is None:
+                logger.info(
+                    f"[{self.workspace}] Collection {self.namespace} missing explicit Milvus field '{field_name}', needs migration"
+                )
+                return True
+
+            if not self._is_field_compatible(existing_field, {"type": "VarChar"}):
+                logger.info(
+                    f"[{self.workspace}] Collection {self.namespace} has incompatible Milvus field '{field_name}', needs migration"
+                )
+                return True
+
+            max_length = self._field_max_length(existing_field)
+            if max_length is not None and max_length < expected_max_length:
+                logger.info(
+                    f"[{self.workspace}] Collection {self.namespace} has {field_name} max_length={max_length}, "
+                    f"needs migration to {expected_max_length}"
+                )
+                return True
+
+        return False
+
     def _check_schema_compatibility(self, collection_info: dict):
         """Check schema field compatibility and detect migration needs"""
         existing_fields = {
@@ -904,9 +1326,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         }
 
         # Check if this is an old collection created with simple schema
-        has_vector_field = any(
-            field.get("name") == "vector" for field in collection_info.get("fields", [])
-        )
+        has_vector_field = self._has_vector_field(collection_info)
 
         if not has_vector_field:
             logger.warning(
@@ -920,8 +1340,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return
 
-        # Check if migration is needed for file_path length restrictions
-        if self._check_file_path_length_restriction(collection_info):
+        if self._check_file_path_length_restriction(
+            collection_info
+        ) or self._check_metadata_schema_migration_needed(collection_info):
             logger.info(
                 f"[{self.workspace}] Starting automatic migration for collection {self.namespace}"
             )
@@ -966,49 +1387,212 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             f"[{self.workspace}] Schema compatibility check passed for {self.namespace}"
         )
 
-    def _migrate_collection_schema(self):
-        """Migrate collection schema using query_iterator - completely solves query window limitations"""
-        original_collection_name = self.final_namespace
-        temp_collection_name = f"{self.final_namespace}_temp"
-        iterator = None
-
+    def _create_collection_with_schema(
+        self, collection_name: str, ignore_index_errors: bool = False
+    ) -> None:
+        original_final_namespace = self.final_namespace
         try:
-            logger.info(
-                f"[{self.workspace}] Starting iterator-based schema migration for {self.namespace}"
-            )
-
-            # Step 1: Create temporary collection with new schema
-            logger.info(
-                f"[{self.workspace}] Step 1: Creating temporary collection: {temp_collection_name}"
-            )
-            # Temporarily update final_namespace for index creation
-            self.final_namespace = temp_collection_name
-            new_schema = self._create_schema_for_namespace()
+            self.final_namespace = collection_name
+            schema = self._create_schema_for_namespace()
             self._client.create_collection(
-                collection_name=temp_collection_name, schema=new_schema
+                collection_name=collection_name, schema=schema
             )
             try:
                 self._create_indexes_after_collection()
             except Exception as index_error:
+                if not ignore_index_errors:
+                    raise
                 logger.warning(
                     f"[{self.workspace}] Failed to create indexes for new collection: {index_error}"
                 )
-                # Continue with migration even if index creation fails
+        finally:
+            self.final_namespace = original_final_namespace
 
-            # Load the new collection
-            self._client.load_collection(temp_collection_name)
+    def _recover_interrupted_inplace_migration(
+        self, target_collection_name: str
+    ) -> str:
+        """Recover from a crash/disconnect inside the in-place migration commit window.
 
-            # Step 2: Copy data using query_iterator (solves query window limitation)
+        An in-place migration vacates the source collection (rename to _old,
+        or the drop-source fallback) in Step 3 *before* promoting the temp
+        collection to the target name in Step 4. A failure between those steps
+        leaves the target name free but the migrated rows stranded in the temp
+        collection (and the pre-migration rows, if any, in _old). Both are
+        recoverable state, never scratch: dropping the temp collection here —
+        as the normal Step 1 reset and the failed-attempt cleanup would —
+        could destroy the only surviving copy.
+
+        Only call this for the in-place case (source == target); a suffix
+        migration never vacates its source. It is a no-op unless the target
+        name is actually missing.
+
+        Returns:
+            "promoted" - temp was renamed to the target; the migration is
+                         complete and the caller should stop.
+            "restored" - the _old backup was renamed back to the target; the
+                         source is restored and a fresh migration can re-run.
+            "none"     - no interrupted commit detected; proceed normally.
+        """
+        if self._client.has_collection(target_collection_name):
+            return "none"
+
+        temp_collection_name = f"{target_collection_name}_temp"
+        old_backup_name = f"{target_collection_name}_old"
+
+        if self._client.has_collection(temp_collection_name):
+            logger.warning(
+                f"[{self.workspace}] Resuming interrupted migration: promoting "
+                f"{temp_collection_name} -> {target_collection_name}"
+            )
+            self._client.rename_collection(temp_collection_name, target_collection_name)
+            # The migrated data is now safe under the target name; the _old
+            # backup (if any) is no longer the active copy, so release it.
+            if self._client.has_collection(old_backup_name):
+                try:
+                    self._client.release_collection(old_backup_name)
+                except Exception as release_error:
+                    logger.warning(
+                        f"[{self.workspace}] Failed to release backup collection "
+                        f"{old_backup_name}: {release_error}"
+                    )
+            return "promoted"
+
+        if self._client.has_collection(old_backup_name):
+            logger.warning(
+                f"[{self.workspace}] Resuming interrupted migration: restoring "
+                f"{old_backup_name} -> {target_collection_name} (no migrated copy survived)"
+            )
+            self._client.rename_collection(old_backup_name, target_collection_name)
+            return "restored"
+
+        return "none"
+
+    def _migrate_collection_schema(
+        self,
+        source_collection_name: str | None = None,
+        target_collection_name: str | None = None,
+    ):
+        """Run the iterator-based migration, retrying transient connection failures.
+
+        Each attempt is idempotent: it starts by dropping the leftover _temp
+        collection and the source collection is never touched until the final
+        rename, so a failed attempt can always be re-run from scratch. A
+        connection-class failure leaves the current MilvusClient permanently
+        dead (see _rebuild_milvus_client), so every retry rebuilds the client
+        before re-running the attempt.
+        """
+        attempt = 0
+        backoff = self._migration_retry_backoff
+        needs_client_rebuild = False
+
+        while True:
+            try:
+                if needs_client_rebuild:
+                    self._rebuild_milvus_client()
+                    needs_client_rebuild = False
+                return self._migrate_collection_schema_attempt(
+                    source_collection_name=source_collection_name,
+                    target_collection_name=target_collection_name,
+                )
+            except Exception as e:
+                if not self._is_retryable_connection_error(e):
+                    raise
+                attempt += 1
+                if attempt > self._migration_max_retries:
+                    logger.error(
+                        f"[{self.workspace}] Migration of {self.namespace} failed after "
+                        f"{attempt} attempt(s) due to connection errors"
+                    )
+                    raise
+                needs_client_rebuild = True
+                logger.warning(
+                    f"[{self.workspace}] Migration attempt "
+                    f"{attempt}/{self._migration_max_retries + 1} for {self.namespace} "
+                    f"failed with a connection error: {e}. "
+                    f"Rebuilding Milvus client and retrying in {backoff:.0f}s"
+                )
+                time.sleep(backoff)
+                backoff = min(
+                    backoff * MILVUS_MIGRATION_RETRY_BACKOFF_MULTIPLIER,
+                    self._migration_retry_max_backoff,
+                )
+
+    def _migrate_collection_schema_attempt(
+        self,
+        source_collection_name: str | None = None,
+        target_collection_name: str | None = None,
+    ):
+        source_collection_name = source_collection_name or self.final_namespace
+        target_collection_name = target_collection_name or self.final_namespace
+        temp_collection_name = f"{target_collection_name}_temp"
+        original_final_namespace = self.final_namespace
+        is_inplace = source_collection_name == target_collection_name
+        iterator = None
+        # Once an in-place migration has vacated its source (Step 3), the temp
+        # collection holds the only migrated copy and must not be dropped by
+        # the failure cleanup below — a later attempt or startup recovers it.
+        commit_phase = False
+        # True once we explicitly loaded a suffix migration's legacy source, so
+        # the failure cleanup can release it again (in-place sources are the
+        # active collection and are left as-is).
+        source_loaded = False
+
+        try:
             logger.info(
-                f"[{self.workspace}] Step 2: Copying data using query_iterator from: {original_collection_name}"
+                f"[{self.workspace}] Starting iterator-based schema migration for {self.namespace}: "
+                f"{source_collection_name} -> {target_collection_name}"
             )
 
-            # Create query iterator
+            # A previous attempt may have failed inside the in-place commit
+            # window (after the source was vacated). Finish that commit instead
+            # of restarting the copy, which would drop the recovery copy.
+            if is_inplace:
+                recovery = self._recover_interrupted_inplace_migration(
+                    target_collection_name
+                )
+                if recovery == "promoted":
+                    self.final_namespace = target_collection_name
+                    return
+                # "restored": the source is back, fall through to a clean copy.
+                # "none": nothing to recover, proceed normally.
+
+            logger.info(
+                f"[{self.workspace}] Step 1: Creating temporary collection: {temp_collection_name}"
+            )
+            if self._client.has_collection(temp_collection_name):
+                self._client.drop_collection(temp_collection_name)
+            self._create_collection_with_schema(
+                temp_collection_name, ignore_index_errors=True
+            )
+
+            # The temp collection is deliberately NOT loaded here: insert does
+            # not require a loaded collection, and loading it would keep every
+            # migrated row's growing segments in query-node memory for the
+            # whole bulk copy (nearly doubling the collection's footprint on
+            # the server). The final collection is loaded after the rename via
+            # _ensure_collection_loaded.
+
+            logger.info(
+                f"[{self.workspace}] Step 2: Copying data using query_iterator from: {source_collection_name}"
+            )
+
+            # query_iterator issues a server-side query, which requires the
+            # source collection to be loaded. An in-place source is the active
+            # collection and is already loaded, but a legacy/suffix source is
+            # typically NOT loaded (it is an old backup), so the iterator setup
+            # fails with "collection not loaded" (code 101). Load it explicitly
+            # (idempotent); on a successful migration the source becomes the
+            # backup and is released again from memory at the end.
+            self._client.load_collection(source_collection_name)
+            # Only track suffix loads: an in-place source is the active
+            # collection and must not be released on failure.
+            source_loaded = not is_inplace
+
             try:
                 iterator = self._client.query_iterator(
-                    collection_name=original_collection_name,
-                    batch_size=2000,  # Adjustable batch size for optimal performance
-                    output_fields=["*"],  # Get all fields
+                    collection_name=source_collection_name,
+                    batch_size=self._migration_iterator_batch_size,
+                    output_fields=["*"],
                 )
                 logger.debug(f"[{self.workspace}] Query iterator created successfully")
             except Exception as iterator_error:
@@ -1017,9 +1601,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 )
                 raise
 
-            # Iterate through all data
             total_migrated = 0
             batch_number = 1
+            rows_since_flush = 0
 
             while True:
                 try:
@@ -1028,18 +1612,54 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         # No more data available
                         break
 
-                    # Insert batch data to new collection
+                    sanitized_batch_data = [
+                        self._normalize_migration_row(row) for row in batch_data
+                    ]
+                    insert_batches = self._build_upsert_batches(
+                        sanitized_batch_data,
+                        max_payload_bytes=self._max_upsert_payload_bytes,
+                        max_records_per_batch=self._max_upsert_records_per_batch,
+                    )
                     try:
-                        self._client.insert(
-                            collection_name=temp_collection_name, data=batch_data
-                        )
+                        for insert_batch_number, (
+                            records_batch,
+                            estimated_bytes,
+                        ) in enumerate(insert_batches, 1):
+                            logger.debug(
+                                f"[{self.workspace}] Milvus migration insert batch "
+                                f"{batch_number}.{insert_batch_number}/{len(insert_batches)}: "
+                                f"records={len(records_batch)}, estimated_payload_bytes={estimated_bytes}"
+                            )
+                            self._client.insert(
+                                collection_name=temp_collection_name,
+                                data=records_batch,
+                            )
                         total_migrated += len(batch_data)
+                        rows_since_flush += len(batch_data)
 
                         logger.info(
                             f"[{self.workspace}] Iterator batch {batch_number}: "
                             f"processed {len(batch_data)} records, total migrated: {total_migrated}"
                         )
                         batch_number += 1
+
+                        # Seal the accumulated insert buffer to bound the
+                        # data-node memory and block until the flush returns,
+                        # giving the server back-pressure during a large copy.
+                        if (
+                            self._migration_flush_interval_rows > 0
+                            and rows_since_flush >= self._migration_flush_interval_rows
+                        ):
+                            logger.info(
+                                f"[{self.workspace}] Flushing temp collection after "
+                                f"{rows_since_flush} rows (total migrated: {total_migrated})"
+                            )
+                            self._client.flush(temp_collection_name)
+                            rows_since_flush = 0
+
+                        # Optional throttle to let a small server breathe.
+                        if self._migration_batch_sleep > 0:
+                            time.sleep(self._migration_batch_sleep)
 
                     except Exception as batch_error:
                         logger.error(
@@ -1053,6 +1673,14 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     )
                     raise
 
+            # Final flush so the last unsealed insert buffer is persisted and
+            # released before the collection is promoted and loaded.
+            if self._migration_flush_interval_rows > 0 and total_migrated > 0:
+                logger.info(
+                    f"[{self.workspace}] Final flush of temp collection ({total_migrated} rows migrated)"
+                )
+                self._client.flush(temp_collection_name)
+
             if total_migrated > 0:
                 logger.info(
                     f"[{self.workspace}] Successfully migrated {total_migrated} records using iterator"
@@ -1062,70 +1690,140 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     f"[{self.workspace}] No data found in original collection, migration completed"
                 )
 
-            # Step 3: Rename origin collection (keep for safety)
-            logger.info(
-                f"[{self.workspace}] Step 3: Rename origin collection to {original_collection_name}_old"
-            )
-            try:
-                self._client.rename_collection(
-                    original_collection_name, f"{original_collection_name}_old"
+            backup_collection_name: str | None = None
+            if is_inplace:
+                logger.info(
+                    f"[{self.workspace}] Step 3: Rename origin collection to {source_collection_name}_old"
                 )
-            except Exception as rename_error:
+                # Entering the commit window: from here the source is vacated,
+                # so the temp collection becomes the recovery copy and must
+                # survive a failure rather than being cleaned up as scratch.
+                commit_phase = True
+                old_backup_name = f"{source_collection_name}_old"
                 try:
-                    logger.warning(
-                        f"[{self.workspace}] Try to drop origin collection instead"
+                    # Drop a stale backup from a previous migration first:
+                    # rename_collection cannot overwrite an existing name, and
+                    # a failed rename here falls back to dropping the source
+                    # collection outright (losing the backup entirely).
+                    if self._client.has_collection(old_backup_name):
+                        logger.info(
+                            f"[{self.workspace}] Dropping stale backup collection {old_backup_name}"
+                        )
+                        self._client.drop_collection(old_backup_name)
+                    self._client.rename_collection(
+                        source_collection_name, old_backup_name
                     )
-                    self._client.drop_collection(original_collection_name)
-                except Exception as e:
-                    logger.error(
-                        f"[{self.workspace}] Rename operation failed: {rename_error}"
-                    )
-                    raise e
+                    backup_collection_name = old_backup_name
+                except Exception as rename_error:
+                    try:
+                        logger.warning(
+                            f"[{self.workspace}] Try to drop origin collection instead"
+                        )
+                        self._client.drop_collection(source_collection_name)
+                    except Exception as e:
+                        logger.error(
+                            f"[{self.workspace}] Rename operation failed: {rename_error}"
+                        )
+                        raise e
+            elif self._client.has_collection(target_collection_name):
+                raise RuntimeError(
+                    f"Target collection already exists: {target_collection_name}"
+                )
+            else:
+                # Suffix migration: the legacy source collection stays in
+                # place as the backup.
+                backup_collection_name = source_collection_name
 
-            # Step 4: Rename temporary collection to original name
             logger.info(
-                f"[{self.workspace}] Step 4: Renaming collection {temp_collection_name} -> {original_collection_name}"
+                f"[{self.workspace}] Step 4: Renaming collection {temp_collection_name} -> {target_collection_name}"
             )
             try:
                 self._client.rename_collection(
-                    temp_collection_name, original_collection_name
+                    temp_collection_name, target_collection_name
                 )
                 logger.info(f"[{self.workspace}] Rename operation completed")
             except Exception as rename_error:
-                logger.error(
-                    f"[{self.workspace}] Rename operation failed: {rename_error}"
-                )
+                if source_collection_name == target_collection_name:
+                    logger.error(
+                        f"[{self.workspace}] Rename operation failed: {rename_error}"
+                    )
+                else:
+                    logger.error(
+                        f"[{self.workspace}] Target rename operation failed: {rename_error}"
+                    )
                 raise RuntimeError(
                     f"Failed to rename collection: {rename_error}"
                 ) from rename_error
 
-            # Restore final_namespace
-            self.final_namespace = original_collection_name
+            self.final_namespace = target_collection_name
+
+            # The backup collection (legacy source or renamed _old) inherits
+            # the loaded state of the pre-migration active collection, which
+            # would keep a full second copy of the data in query-node memory
+            # forever. Release it so the backup only occupies disk.
+            if backup_collection_name is not None:
+                try:
+                    self._client.release_collection(backup_collection_name)
+                    logger.info(
+                        f"[{self.workspace}] Released backup collection {backup_collection_name} from memory"
+                    )
+                except Exception as release_error:
+                    logger.warning(
+                        f"[{self.workspace}] Failed to release backup collection "
+                        f"{backup_collection_name}: {release_error}"
+                    )
 
         except Exception as e:
+            self.final_namespace = original_final_namespace
             logger.error(
                 f"[{self.workspace}] Iterator-based migration failed for {self.namespace}: {e}"
             )
 
-            # Attempt cleanup of temporary collection if it exists
-            try:
-                if self._client and self._client.has_collection(temp_collection_name):
-                    logger.info(
-                        f"[{self.workspace}] Cleaning up failed migration temporary collection"
-                    )
-                    self._client.drop_collection(temp_collection_name)
-            except Exception as cleanup_error:
+            if commit_phase:
+                # The source has already been vacated, so the temp collection
+                # is the only migrated copy: keep it as recovery state. The
+                # next attempt (or startup) finishes the interrupted commit via
+                # _recover_interrupted_inplace_migration.
                 logger.warning(
-                    f"[{self.workspace}] Failed to cleanup temporary collection: {cleanup_error}"
+                    f"[{self.workspace}] Migration failed after the source was vacated; "
+                    f"keeping {temp_collection_name} as recovery state for the next attempt or startup"
                 )
+            else:
+                try:
+                    if self._client and self._client.has_collection(
+                        temp_collection_name
+                    ):
+                        logger.info(
+                            f"[{self.workspace}] Cleaning up failed migration temporary collection"
+                        )
+                        self._client.drop_collection(temp_collection_name)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"[{self.workspace}] Failed to cleanup temporary collection: {cleanup_error}. "
+                        f"The leftover temp collection will be dropped on the next migration attempt or startup"
+                    )
 
-            # Re-raise the original error
+            # Release the suffix source we loaded above so a failed startup or
+            # retry does not leave a full backup resident in query-node memory.
+            # In-place sources are the active collection and are left as-is.
+            if source_loaded:
+                try:
+                    self._client.release_collection(source_collection_name)
+                    logger.info(
+                        f"[{self.workspace}] Released source collection "
+                        f"{source_collection_name} from memory after failed migration"
+                    )
+                except Exception as release_error:
+                    logger.warning(
+                        f"[{self.workspace}] Failed to release source collection "
+                        f"{source_collection_name}: {release_error}"
+                    )
+
             raise RuntimeError(
                 f"Iterator-based migration failed for collection {self.namespace}: {e}"
             ) from e
 
         finally:
-            # Ensure iterator is properly closed
             if iterator:
                 try:
                     iterator.close()
@@ -1157,6 +1855,56 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 f"[{self.workspace}] Collection compatibility validation failed for {self.namespace}: {e}"
             )
             raise
+
+    def _validate_collection_and_load(self) -> None:
+        try:
+            self._client.describe_collection(self.final_namespace)
+            self._validate_collection_compatibility()
+        except Exception as validation_error:
+            logger.error(
+                f"[{self.workspace}] CRITICAL ERROR: Collection '{self.namespace}' exists but validation failed!"
+            )
+            logger.error(
+                f"[{self.workspace}] This indicates potential data migration failure or schema incompatibility."
+            )
+            logger.error(f"[{self.workspace}] Validation error: {validation_error}")
+            logger.error(f"[{self.workspace}] MANUAL INTERVENTION REQUIRED:")
+            logger.error(
+                f"[{self.workspace}] 1. Check the existing collection schema and data integrity"
+            )
+            logger.error(f"[{self.workspace}] 2. Backup existing data if needed")
+            logger.error(
+                f"[{self.workspace}] 3. Manually resolve schema compatibility issues"
+            )
+            logger.error(
+                f"[{self.workspace}] 4. Consider recreating the collection using: lightrag-rebuild-vdb "
+            )
+            logger.error(
+                f"[{self.workspace}] Program execution stopped to prevent potential data loss."
+            )
+            raise RuntimeError(
+                f"Collection validation failed for '{self.final_namespace}'. "
+                f"Data migration failure detected. Manual intervention required to prevent data loss. "
+                f"Original error: {validation_error}"
+            )
+
+        try:
+            self._ensure_collection_loaded()
+        except Exception as load_error:
+            if not self._is_missing_vector_index_error(load_error):
+                raise
+
+            try:
+                self._repair_missing_vector_index()
+                self._ensure_collection_loaded()
+                logger.info(
+                    f"[{self.workspace}] Repaired missing vector index for existing collection '{self.namespace}'"
+                )
+            except Exception as repair_error:
+                raise RuntimeError(
+                    f"Index repair failed for collection '{self.final_namespace}'. "
+                    f"Original error: {repair_error}"
+                ) from repair_error
 
     @staticmethod
     def _is_missing_vector_index_error(error: Exception) -> bool:
@@ -1199,87 +1947,82 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         """Create collection if not exists and check existing collection compatibility"""
 
         try:
-            # Check if our specific collection exists
             collection_exists = self._client.has_collection(self.final_namespace)
             logger.info(
                 f"[{self.workspace}] VectorDB collection '{self.namespace}' exists check: {collection_exists}"
             )
 
             if collection_exists:
-                # Double-check by trying to describe the collection
-                try:
-                    self._client.describe_collection(self.final_namespace)
-                    self._validate_collection_compatibility()
+                self._validate_collection_and_load()
+                return
+
+            legacy_collection_exists = (
+                self.legacy_namespace != self.final_namespace
+                and self._client.has_collection(self.legacy_namespace)
+            )
+
+            # Interrupted in-place commit recovery — MUST run before the legacy
+            # migration below. An in-place migration vacates its source (Step 3)
+            # before promoting the temp collection to the target name (Step 4);
+            # a crash in that window leaves the target name free with the
+            # completed copy stranded in {final}_temp and the pre-migration data
+            # in {final}_old. If a legacy migration ran first it would migrate
+            # the stale legacy collection over the target and drop {final}_temp
+            # as scratch (Step 1), silently losing every write made to the
+            # suffixed collection since the legacy split.
+            #
+            # {final}_old is the reliable marker that an in-place copy COMPLETED
+            # (it only ever exists once Step 3 renamed the source): when it is
+            # present, recover unconditionally. A lone {final}_temp next to a
+            # live legacy source is instead an aborted *partial* suffix copy and
+            # must be treated as scratch by the legacy migration — so only
+            # recover a lone temp when there is no legacy source to fall back to.
+            temp_collection_name = f"{self.final_namespace}_temp"
+            old_backup_name = f"{self.final_namespace}_old"
+            has_old_backup = self._client.has_collection(old_backup_name)
+            has_temp = self._client.has_collection(temp_collection_name)
+            if has_old_backup or (has_temp and not legacy_collection_exists):
+                recovery = self._recover_interrupted_inplace_migration(
+                    self.final_namespace
+                )
+                if recovery in ("promoted", "restored"):
+                    self._ensure_collection_loaded()
+                    return
+
+            if legacy_collection_exists:
+                legacy_collection_info = self._client.describe_collection(
+                    self.legacy_namespace
+                )
+                if not self._has_vector_field(legacy_collection_info):
+                    # Old simple-schema collection with no vector field: its rows
+                    # carry no vectors, so migrating them into the required-vector
+                    # schema would fail at insert and block startup. Skip the
+                    # migration and create a fresh suffixed collection instead.
+                    logger.warning(
+                        f"[{self.workspace}] Legacy collection '{self.legacy_namespace}' "
+                        f"has no vector field (old simple schema); cannot migrate its rows "
+                        f"into '{self.final_namespace}'. Creating a new collection instead."
+                    )
+                else:
                     try:
-                        # Ensure the collection is loaded after validation
+                        self._check_vector_dimension(legacy_collection_info)
+                    except ValueError as legacy_error:
+                        logger.warning(
+                            f"[{self.workspace}] Legacy collection '{self.legacy_namespace}' "
+                            f"is not compatible with '{self.final_namespace}': {legacy_error}. "
+                            f"Creating a new collection without migrating legacy vectors."
+                        )
+                    else:
+                        self._migrate_collection_schema(
+                            source_collection_name=self.legacy_namespace,
+                            target_collection_name=self.final_namespace,
+                        )
                         self._ensure_collection_loaded()
                         return
-                    except Exception as load_error:
-                        if not self._is_missing_vector_index_error(load_error):
-                            raise
-
-                        try:
-                            self._repair_missing_vector_index()
-                            self._ensure_collection_loaded()
-                            logger.info(
-                                f"[{self.workspace}] Repaired missing vector index for existing collection '{self.namespace}'"
-                            )
-                            return
-                        except Exception as repair_error:
-                            raise RuntimeError(
-                                f"Index repair failed for collection '{self.final_namespace}'. "
-                                f"Original error: {repair_error}"
-                            ) from repair_error
-                except Exception as validation_error:
-                    # CRITICAL: Collection exists but validation failed
-                    # This indicates potential data migration failure or incompatible schema
-                    # Stop execution to prevent data loss and require manual intervention
-                    logger.error(
-                        f"[{self.workspace}] CRITICAL ERROR: Collection '{self.namespace}' exists but validation failed!"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] This indicates potential data migration failure or schema incompatibility."
-                    )
-                    logger.error(
-                        f"[{self.workspace}] Validation error: {validation_error}"
-                    )
-                    logger.error(f"[{self.workspace}] MANUAL INTERVENTION REQUIRED:")
-                    logger.error(
-                        f"[{self.workspace}] 1. Check the existing collection schema and data integrity"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] 2. Backup existing data if needed"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] 3. Manually resolve schema compatibility issues"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] 4. Consider dropping and recreating the collection if data is not critical"
-                    )
-                    logger.error(
-                        f"[{self.workspace}] Program execution stopped to prevent potential data loss."
-                    )
-
-                    # Raise a specific exception to stop execution
-                    raise RuntimeError(
-                        f"Collection validation failed for '{self.final_namespace}'. "
-                        f"Data migration failure detected. Manual intervention required to prevent data loss. "
-                        f"Original error: {validation_error}"
-                    )
 
             # Collection doesn't exist, create new collection
             logger.info(f"[{self.workspace}] Creating new collection: {self.namespace}")
-            schema = self._create_schema_for_namespace()
-
-            # Create collection with schema only first
-            self._client.create_collection(
-                collection_name=self.final_namespace, schema=schema
-            )
-
-            # Then create indexes
-            self._create_indexes_after_collection()
-
-            # Load the newly created collection
+            self._create_collection_with_schema(self.final_namespace)
             self._ensure_collection_loaded()
 
             logger.info(
@@ -1292,6 +2035,19 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             raise
 
         except Exception as e:
+            # A transient connection failure must never trigger the
+            # force-create fallback below: dropping and recreating the
+            # collection on a flaky connection would destroy healthy data
+            # (or create an empty suffixed collection that permanently
+            # shadows an unmigrated legacy collection). Let it propagate so
+            # initialize() fails and can be retried.
+            if self._is_retryable_connection_error(e):
+                logger.error(
+                    f"[{self.workspace}] Connection error in _create_collection_if_not_exist "
+                    f"for {self.namespace}: {e}"
+                )
+                raise
+
             logger.error(
                 f"[{self.workspace}] Error in _create_collection_if_not_exist for {self.namespace}: {e}"
             )
@@ -1314,11 +2070,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     )
 
                 # Create fresh collection
-                schema = self._create_schema_for_namespace()
-                self._client.create_collection(
-                    collection_name=self.final_namespace, schema=schema
-                )
-                self._create_indexes_after_collection()
+                self._create_collection_with_schema(self.final_namespace)
 
                 # Load the newly created collection
                 self._ensure_collection_loaded()
@@ -1334,6 +2086,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 raise
 
     def __post_init__(self):
+        validate_workspace(self.workspace)
         self._validate_embedding_func()
 
         # Extract MilvusIndexConfig parameters from vector_db_storage_cls_kwargs
@@ -1389,18 +2142,24 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     f"Using passed workspace parameter: '{effective_workspace}'"
                 )
 
-        # Build final_namespace with workspace prefix for data isolation
-        # Keep original namespace unchanged for type detection logic
-        if effective_workspace:
-            self.final_namespace = f"{effective_workspace}_{self.namespace}"
+        self.workspace = effective_workspace or ""
+        self.model_suffix = self._generate_collection_suffix()
+        if self.workspace:
+            self.legacy_namespace = f"{self.workspace}_{self.namespace}"
             logger.debug(
-                f"Final namespace with workspace prefix: '{self.final_namespace}'"
+                f"Legacy namespace with workspace prefix: '{self.legacy_namespace}'"
             )
         else:
-            # When workspace is empty, final_namespace equals original namespace
-            self.final_namespace = self.namespace
-            self.workspace = ""
-            logger.debug(f"Final namespace (no workspace): '{self.final_namespace}'")
+            self.legacy_namespace = self.namespace
+            logger.debug(f"Legacy namespace (no workspace): '{self.legacy_namespace}'")
+        if self.model_suffix:
+            self.final_namespace = f"{self.legacy_namespace}_{self.model_suffix}"
+            logger.info(f"Milvus collection: {self.final_namespace}")
+        else:
+            self.final_namespace = self.legacy_namespace
+            logger.warning(
+                f"Milvus collection: {self.final_namespace} missing suffix. Please add model_name to embedding_func for proper model-based data isolation."
+            )
         cosine_threshold = kwargs.get("cosine_better_than_threshold")
         if cosine_threshold is None:
             raise ValueError(
@@ -1411,11 +2170,101 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Ensure created_at is in meta_fields
         if "created_at" not in self.meta_fields:
             self.meta_fields.add("created_at")
+        self._varchar_field_limits = self._get_varchar_field_limits_for_namespace()
 
         # Initialize client as None - will be created in initialize() method
         self._client = None
         self._max_batch_size = self.global_config["embedding_batch_num"]
+
+        # Flush-time batching limits (see module-level DEFAULT_MILVUS_* constants).
+        # A non-positive value disables that splitting dimension.
+        self._max_upsert_payload_bytes = int(
+            os.getenv(
+                "MILVUS_UPSERT_MAX_PAYLOAD_BYTES",
+                str(DEFAULT_MILVUS_UPSERT_MAX_PAYLOAD_BYTES),
+            )
+        )
+        self._max_upsert_records_per_batch = int(
+            os.getenv(
+                "MILVUS_UPSERT_MAX_RECORDS_PER_BATCH",
+                str(DEFAULT_MILVUS_UPSERT_MAX_RECORDS_PER_BATCH),
+            )
+        )
+        self._max_delete_records_per_batch = int(
+            os.getenv(
+                "MILVUS_DELETE_MAX_RECORDS_PER_BATCH",
+                str(DEFAULT_MILVUS_DELETE_MAX_RECORDS_PER_BATCH),
+            )
+        )
+        if self._max_upsert_payload_bytes <= 0:
+            logger.warning(
+                f"MILVUS_UPSERT_MAX_PAYLOAD_BYTES={self._max_upsert_payload_bytes} is non-positive, disable payload-size splitting"
+            )
+        if self._max_upsert_records_per_batch <= 0:
+            logger.warning(
+                f"MILVUS_UPSERT_MAX_RECORDS_PER_BATCH={self._max_upsert_records_per_batch} is non-positive, disable upsert record-count splitting"
+            )
+        if self._max_delete_records_per_batch <= 0:
+            logger.warning(
+                f"MILVUS_DELETE_MAX_RECORDS_PER_BATCH={self._max_delete_records_per_batch} is non-positive, disable delete record-count splitting"
+            )
+
+        # Schema-migration retry knobs (see DEFAULT_MILVUS_MIGRATION_*
+        # constants). MILVUS_MIGRATION_MAX_RETRIES=0 restores fail-fast.
+        self._migration_max_retries = max(
+            0,
+            _get_env_int(
+                "MILVUS_MIGRATION_MAX_RETRIES", DEFAULT_MILVUS_MIGRATION_MAX_RETRIES
+            ),
+        )
+        self._migration_retry_backoff = float(
+            os.getenv(
+                "MILVUS_MIGRATION_RETRY_BACKOFF",
+                str(DEFAULT_MILVUS_MIGRATION_RETRY_BACKOFF_SECONDS),
+            )
+        )
+        self._migration_retry_max_backoff = float(
+            os.getenv(
+                "MILVUS_MIGRATION_RETRY_MAX_BACKOFF",
+                str(DEFAULT_MILVUS_MIGRATION_RETRY_MAX_BACKOFF_SECONDS),
+            )
+        )
+        self._migration_iterator_batch_size = _get_env_int(
+            "MILVUS_MIGRATION_ITERATOR_BATCH_SIZE",
+            DEFAULT_MILVUS_MIGRATION_ITERATOR_BATCH_SIZE,
+        )
+
+        # Schema-migration memory back-pressure knobs (see the
+        # DEFAULT_MILVUS_MIGRATION_FLUSH_*/_BATCH_SLEEP_* constants).
+        self._migration_flush_interval_rows = max(
+            0,
+            _get_env_int(
+                "MILVUS_MIGRATION_FLUSH_INTERVAL_ROWS",
+                DEFAULT_MILVUS_MIGRATION_FLUSH_INTERVAL_ROWS,
+            ),
+        )
+        self._migration_batch_sleep = max(
+            0.0,
+            float(
+                os.getenv(
+                    "MILVUS_MIGRATION_BATCH_SLEEP",
+                    str(DEFAULT_MILVUS_MIGRATION_BATCH_SLEEP_SECONDS),
+                )
+            ),
+        )
         self._initialized = False
+
+        # Deferred-embedding buffers and the per-namespace flush lock.
+        # The lock keys on final_namespace so two instances pointing at the
+        # same Milvus collection (e.g. when MILVUS_WORKSPACE env override is
+        # used) share a single writer lock. We construct it here in
+        # __post_init__ — not in initialize() — so any code path that
+        # touches the buffer before initialize() still has a valid lock.
+        self._pending_vector_docs: dict[str, _PendingVectorDoc] = {}
+        self._pending_vector_deletes: set[str] = set()
+        self._flush_lock = get_namespace_lock(
+            namespace=self.final_namespace, workspace=""
+        )
 
     async def initialize(self):
         """Initialize Milvus collection"""
@@ -1455,47 +2304,56 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 raise
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        # logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
+        """Buffer vector docs for embedding and batched flush.
+
+        Embedding deliberately does NOT happen here: repeated upserts of the
+        same id, or many small batches, collapse into a single flush-time
+        embedding pass. Reads (`get_by_id`/`get_by_ids`/`get_vectors_by_ids`)
+        observe pending docs via the same lock for read-your-writes.
+        """
         if not data:
             return
 
-        # Ensure collection is loaded before upserting
-        self._ensure_collection_loaded()
-
-        import time
-
         current_time = int(time.time())
 
-        list_data: list[dict[str, Any]] = [
-            {
-                "id": k,
-                "created_at": current_time,
-                **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
-            }
-            for k, v in data.items()
-        ]
-        contents = [v["content"] for v in data.values()]
-        batches = [
-            contents[i : i + self._max_batch_size]
-            for i in range(0, len(contents), self._max_batch_size)
-        ]
+        pending_docs: list[tuple[str, _PendingVectorDoc]] = []
+        for i, (k, v) in enumerate(data.items(), start=1):
+            # _sanitize_varchar_fields already byte-truncates the stored
+            # `content` when it is a meta field; the pending doc keeps the full
+            # untruncated text so the embedding sees the complete chunk.
+            source = self._sanitize_varchar_fields(
+                {
+                    "id": k,
+                    "created_at": current_time,
+                    **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
+                }
+            )
+            pending_docs.append(
+                (
+                    k,
+                    _PendingVectorDoc(source=source, content=v["content"]),
+                )
+            )
+            await _cooperative_yield(i)
 
-        embedding_tasks = [
-            self.embedding_func(batch, context="document") for batch in batches
-        ]
-        embeddings_list = await asyncio.gather(*embedding_tasks)
-
-        embeddings = np.concatenate(embeddings_list)
-        for i, d in enumerate(list_data):
-            d["vector"] = embeddings[i]
-        results = self._client.upsert(
-            collection_name=self.final_namespace, data=list_data
-        )
-        return results
+        # An upsert overrides any pending delete on the same id; installing
+        # a fresh _PendingVectorDoc instance invalidates any vector cached
+        # by a prior get_vectors_by_ids() call on a stale revision.
+        async with self._flush_lock:
+            for doc_id, pdoc in pending_docs:
+                self._pending_vector_deletes.discard(doc_id)
+                self._pending_vector_docs[doc_id] = pdoc
 
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict[str, Any]]:
+        """Similarity search against the persisted Milvus collection.
+
+        Note: buffered-but-unflushed upserts are NOT visible to this method —
+        they exist only in `_pending_vector_docs` until `index_done_callback()`
+        embeds and writes them. Callers that need read-after-write visibility
+        for similarity search must run an explicit flush first.
+        """
         # Ensure collection is loaded before querying
         self._ensure_collection_loaded()
 
@@ -1504,7 +2362,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             embedding = [query_embedding]  # Milvus expects a list of embeddings
         else:
             embedding = await self.embedding_func(
-                [query], context="query", _priority=5
+                [query], context="query", _priority=DEFAULT_QUERY_PRIORITY
             )  # higher priority for query
 
         # Include all meta_fields (created_at is now always included)
@@ -1539,121 +2397,451 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             for dp in results[0]
         ]
 
+    @staticmethod
+    def _build_upsert_batches(
+        records: list[dict[str, Any]],
+        max_payload_bytes: int,
+        max_records_per_batch: int,
+    ) -> list[tuple[list[dict[str, Any]], int]]:
+        """Split upsert records into batches by estimated payload size and count.
+
+        The byte budget is the primary limiter: records accumulate until adding
+        the next one would exceed ``max_payload_bytes``, then a new batch starts.
+        Size is estimated by JSON-serializing each record; this overestimates the
+        actual gRPC protobuf size (a JSON float string is far longer than the 4
+        protobuf bytes it encodes), so the split stays conservatively below the
+        server limit and never underestimates.
+
+        A single record larger than the byte budget is emitted as its own batch
+        rather than raising: JSON overestimation means such a record's real
+        protobuf size is often still under Milvus' 64MB ceiling, so we let the
+        server be the final arbiter instead of failing client-side. Returns a
+        list of ``(batch, estimated_bytes)`` tuples (estimate used for logging).
+        """
+        if not records:
+            return []
+
+        payload_limit = max_payload_bytes if max_payload_bytes > 0 else float("inf")
+        records_limit = (
+            max_records_per_batch if max_records_per_batch > 0 else float("inf")
+        )
+
+        batches: list[tuple[list[dict[str, Any]], int]] = []
+        current_batch: list[dict[str, Any]] = []
+        # JSON array overhead ("[]")
+        current_estimated_bytes = 2
+
+        for record in records:
+            record_size = len(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+
+            # If current batch not empty, a comma is needed before next element.
+            separator_overhead = 1 if current_batch else 0
+            next_batch_size = current_estimated_bytes + separator_overhead + record_size
+
+            if current_batch and (
+                len(current_batch) >= records_limit or next_batch_size > payload_limit
+            ):
+                batches.append((current_batch, current_estimated_bytes))
+                current_batch = []
+                current_estimated_bytes = 2
+                next_batch_size = current_estimated_bytes + record_size
+
+            current_batch.append(record)
+            current_estimated_bytes = next_batch_size
+
+        if current_batch:
+            batches.append((current_batch, current_estimated_bytes))
+
+        return batches
+
     async def index_done_callback(self) -> None:
-        # Milvus handles persistence automatically
-        pass
+        """Flush all buffered vector ops to Milvus before returning.
 
-    async def delete_entity(self, entity_name: str) -> None:
-        """Delete an entity from the vector database
-
-        Args:
-            entity_name: The name of the entity to delete
+        Contract: on a successful return, every previously buffered upsert
+        has been embedded and committed to the collection, and every buffered
+        delete has been issued — i.e. all pending vectors are durable in
+        Milvus (which persists automatically once written). On any embed-
+        or server-side failure this method raises and leaves both buffers
+        intact for the next callback to retry; the caller MUST NOT assume
+        clean persistence in that case.
         """
-        try:
-            # Compute entity ID from name
-            entity_id = compute_mdhash_id(entity_name, prefix="ent-")
-            logger.debug(
-                f"[{self.workspace}] Attempting to delete entity {entity_name} with ID {entity_id}"
-            )
+        await self._flush_pending_vector_ops()
 
-            # Delete the entity from Milvus collection
-            result = self._client.delete(
-                collection_name=self.final_namespace, pks=[entity_id]
-            )
+    async def drop_pending_index_ops(self) -> None:
+        """Discard buffered upserts/deletes (pipeline aborting on error)."""
+        async with self._flush_lock:
+            self._pending_vector_docs.clear()
+            self._pending_vector_deletes.clear()
 
-            if result and result.get("delete_count", 0) > 0:
-                logger.debug(
-                    f"[{self.workspace}] Successfully deleted entity {entity_name}"
-                )
-            else:
-                logger.debug(
-                    f"[{self.workspace}] Entity {entity_name} not found in storage"
-                )
+    async def _flush_pending_vector_ops(self) -> None:
+        """Flush buffered vector upserts and deletes to Milvus.
 
-        except Exception as e:
-            logger.error(f"[{self.workspace}] Error deleting entity {entity_name}: {e}")
-
-    async def delete_entity_relation(self, entity_name: str) -> None:
-        """Delete all relations associated with an entity
-
-        Args:
-            entity_name: The name of the entity whose relations should be deleted
+        Embedding runs *inside* this lock (not in `upsert` or lock-free):
+        it makes deferred embedding and bulk indexing atomic against
+        concurrent upserts and destructive mutations. Any failure (embed
+        or server write) raises and leaves both buffers intact; the next
+        `index_done_callback` retries automatically.
         """
-        try:
-            # Ensure collection is loaded before querying
+        async with self._flush_lock:
+            if not self._pending_vector_docs and not self._pending_vector_deletes:
+                return
+            if self._client is None:
+                return
+
+            # Milvus requires the collection to be loaded before upsert/delete.
             self._ensure_collection_loaded()
 
-            # Search for relations where entity is either source or target
-            expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
+            pending_docs = self._pending_vector_docs
+            pending_deletes = self._pending_vector_deletes
 
-            # Find all relations involving this entity
+            docs_to_embed: list[tuple[str, _PendingVectorDoc]] = [
+                (doc_id, pdoc)
+                for doc_id, pdoc in pending_docs.items()
+                if pdoc.vector is None
+            ]
+
+            if docs_to_embed:
+                contents = [pdoc.content for _, pdoc in docs_to_embed]
+                batches = [
+                    contents[i : i + self._max_batch_size]
+                    for i in range(0, len(contents), self._max_batch_size)
+                ]
+                logger.info(
+                    f"[{self.workspace}] {self.namespace} flush: embedding "
+                    f"{len(docs_to_embed)} vectors in {len(batches)} batch(es) "
+                    f"(batch_num={self._max_batch_size})"
+                )
+                try:
+                    embeddings_list = await asyncio.gather(
+                        *[
+                            self.embedding_func(batch, context="document")
+                            for batch in batches
+                        ]
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{self.workspace}] Error embedding pending vector ops "
+                        f"(upserts={len(docs_to_embed)}): {e}"
+                    )
+                    raise
+
+                embeddings = np.concatenate(embeddings_list)
+                if len(embeddings) != len(docs_to_embed):
+                    raise RuntimeError(
+                        f"[{self.workspace}] Embedding count mismatch: expected "
+                        f"{len(docs_to_embed)}, got {len(embeddings)}"
+                    )
+                for i, ((_, pdoc), embedding) in enumerate(
+                    zip(docs_to_embed, embeddings), start=1
+                ):
+                    # Cache as float32 so a second flush after a server-side
+                    # error doesn't re-embed, and so the upsert JSON payload
+                    # stays compact (float32 serializes to a shorter string
+                    # than float64, and Milvus stores FLOAT_VECTOR as float32
+                    # anyway, so the cast is lossless).
+                    pdoc.vector = np.array(embedding, dtype=np.float32).tolist()
+                    await _cooperative_yield(i)
+
+            # Assemble final upsert payload. After the embed loop above every
+            # pending doc has a non-None vector (count-mismatch was checked),
+            # so we can iterate without re-guarding.
+            committed_ids: list[str] = list(pending_docs.keys())
+            # source was already byte-truncated in upsert(); no need to
+            # re-sanitize here (vector is not a VarChar field).
+            list_data: list[dict[str, Any]] = [
+                {
+                    **pending_docs[doc_id].source,
+                    "vector": pending_docs[doc_id].vector,
+                }
+                for doc_id in committed_ids
+            ]
+
+            try:
+                if list_data:
+                    # Split the upsert into batches that stay under the server-side
+                    # 64MB gRPC message limit. Fail-fast: any batch failure raises
+                    # immediately and the full buffer is retained for the next flush.
+                    upsert_batches = self._build_upsert_batches(
+                        list_data,
+                        max_payload_bytes=self._max_upsert_payload_bytes,
+                        max_records_per_batch=self._max_upsert_records_per_batch,
+                    )
+                    if len(upsert_batches) > 1:
+                        logger.info(
+                            f"[{self.workspace}] {self.namespace} flush: upsert split into "
+                            f"{len(upsert_batches)} batches for {len(list_data)} records "
+                            f"(max_payload={self._max_upsert_payload_bytes} batch={self._max_upsert_records_per_batch})"
+                        )
+                    for batch_index, (records_batch, estimated_bytes) in enumerate(
+                        upsert_batches, 1
+                    ):
+                        if (
+                            len(records_batch) == 1
+                            and self._max_upsert_payload_bytes > 0
+                            and estimated_bytes > self._max_upsert_payload_bytes
+                        ):
+                            logger.warning(
+                                f"[{self.workspace}] {self.namespace} flush: single record "
+                                f"id={records_batch[0].get('id')} estimated {estimated_bytes} bytes "
+                                f"exceeds {self._max_upsert_payload_bytes}"
+                            )
+                        logger.debug(
+                            f"[{self.workspace}] Milvus upsert batch {batch_index}/{len(upsert_batches)}: "
+                            f"records={len(records_batch)}, estimated_payload_bytes={estimated_bytes}"
+                        )
+                        self._client.upsert(
+                            collection_name=self.final_namespace, data=records_batch
+                        )
+                if pending_deletes:
+                    # Chunk deletes by record count; pks are short strings so a
+                    # count cap is enough to stay under the gRPC message limit.
+                    delete_ids = list(pending_deletes)
+                    delete_chunk = (
+                        self._max_delete_records_per_batch
+                        if self._max_delete_records_per_batch > 0
+                        else len(delete_ids)
+                    )
+                    for i in range(0, len(delete_ids), delete_chunk):
+                        self._client.delete(
+                            collection_name=self.final_namespace,
+                            pks=delete_ids[i : i + delete_chunk],
+                        )
+            except Exception as e:
+                logger.error(
+                    f"[{self.workspace}] Error flushing vector ops "
+                    f"(upserts={len(pending_docs)}, "
+                    f"deletes={len(pending_deletes)}): {e}"
+                )
+                raise
+
+            # On success, clear the buffers in-place so external references
+            # (e.g. drop()) see the cleared state.
+            for doc_id in committed_ids:
+                pending_docs.pop(doc_id, None)
+            pending_deletes.clear()
+
+    async def delete_entity(self, entity_name: str) -> None:
+        """Buffer an entity vector delete by computing its hash ID."""
+        entity_id = compute_mdhash_id(entity_name, prefix="ent-")
+        async with self._flush_lock:
+            self._pending_vector_docs.pop(entity_id, None)
+            self._pending_vector_deletes.add(entity_id)
+        logger.debug(
+            f"[{self.workspace}] Buffered delete for entity {entity_name} (id={entity_id})"
+        )
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        """Delete all relation vectors where entity appears as src or tgt.
+
+        The whole method runs under ``_flush_lock`` so the server-side query
+        + delete cannot interleave with an in-flight bulk upsert.
+        Server-side failures are re-raised (no log-and-swallow): the caller
+        decides whether to retry.
+
+        Buffer semantics — post-prune with caller short-circuit contract:
+            Matching pending upserts in ``_pending_vector_docs`` are
+            pruned **only after** the server-side query + delete
+            succeeds. On failure the pending buffer stays intact and
+            the exception propagates so the caller (``adelete_by_entity``
+            in ``utils_graph.py``) can short-circuit before
+            ``_persist_graph_updates`` flushes a half-cleaned buffer.
+
+        Semantic note (deferred-buffer ↔ persisted divergence): pruning only
+        consults the *current* buffered ``src_id`` / ``tgt_id`` view; we do
+        not re-read the persisted row a buffered upsert is about to
+        overwrite. So if a pending upsert is rewriting an already-persisted
+        ``rel-X-Y`` so that its new ``src_id`` / ``tgt_id`` matches
+        ``entity_name`` while the persisted row's do not (or vice versa),
+        the persisted row will not be deleted by the server-side filter and
+        the pending overwrite is dropped — i.e. the final state can diverge
+        from the eager-flush ordering (upsert → flush → delete). Callers
+        that require eager-equivalent semantics should call
+        ``index_done_callback()`` before ``delete_entity_relation``.
+        """
+
+        def _prune_pending() -> None:
+            for doc_id in [
+                k
+                for k, v in self._pending_vector_docs.items()
+                if v.source.get("src_id") == entity_name
+                or v.source.get("tgt_id") == entity_name
+            ]:
+                self._pending_vector_docs.pop(doc_id, None)
+
+        async with self._flush_lock:
+            if self._client is None:
+                # No server state to mutate; buffer prune is the only
+                # delete intent we can record.
+                _prune_pending()
+                return
+
+            self._ensure_collection_loaded()
+
+            safe_name = _escape_milvus_str(entity_name)
+            expr = f'src_id == "{safe_name}" or tgt_id == "{safe_name}"'
             results = self._client.query(
-                collection_name=self.final_namespace, filter=expr, output_fields=["id"]
+                collection_name=self.final_namespace,
+                filter=expr,
+                output_fields=["id"],
             )
 
-            if not results or len(results) == 0:
+            if not results:
+                # No server rows to delete — still safe to prune any
+                # pending upserts so they can't re-create the relation.
+                _prune_pending()
                 logger.debug(
                     f"[{self.workspace}] No relations found for entity {entity_name}"
                 )
                 return
 
-            # Extract IDs of relations to delete
             relation_ids = [item["id"] for item in results]
+            self._client.delete(collection_name=self.final_namespace, pks=relation_ids)
+            # Server-side delete succeeded — safe to prune the pending
+            # buffer so subsequent flushes don't re-upsert the deleted
+            # relations.
+            _prune_pending()
             logger.debug(
-                f"[{self.workspace}] Found {len(relation_ids)} relations for entity {entity_name}"
-            )
-
-            # Delete the relations
-            if relation_ids:
-                delete_result = self._client.delete(
-                    collection_name=self.final_namespace, pks=relation_ids
-                )
-
-                logger.debug(
-                    f"[{self.workspace}] Deleted {delete_result.get('delete_count', 0)} relations for {entity_name}"
-                )
-
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Error deleting relations for {entity_name}: {e}"
+                f"[{self.workspace}] Deleted {len(relation_ids)} relations for {entity_name}"
             )
 
     async def delete(self, ids: list[str]) -> None:
-        """Delete vectors with specified IDs
+        """Buffer vector deletes for batched flush."""
+        if not ids:
+            return
+        if isinstance(ids, set):
+            ids = list(ids)
+        async with self._flush_lock:
+            for doc_id in ids:
+                self._pending_vector_docs.pop(doc_id, None)
+                self._pending_vector_deletes.add(doc_id)
+        logger.debug(
+            f"[{self.workspace}] Buffered delete for {len(ids)} vectors in {self.namespace}"
+        )
 
-        Args:
-            ids: List of vector IDs to be deleted
+    @staticmethod
+    def _is_response_too_large_error(error: BaseException) -> bool:
+        """Return True when the error chain says a query() response overflowed.
+
+        Walks __cause__/__context__ like _is_retryable_connection_error,
+        because pymilvus wraps the grpc error in MilvusException and the
+        size text can sit a level down. Connection, schema, parameter and
+        quota errors fall through to False — bisecting those would only
+        re-issue a failure that a smaller page cannot fix, and for a
+        rate-limited call it would re-issue it several times over.
         """
-        try:
-            # Ensure collection is loaded before deleting
-            self._ensure_collection_loaded()
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if any(
+                marker in str(current).lower()
+                for marker in MILVUS_QUERY_RESPONSE_TOO_LARGE_MARKERS
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
-            # Delete vectors by IDs
-            result = self._client.delete(collection_name=self.final_namespace, pks=ids)
+    def _resolve_query_page_size(self, *, includes_vector: bool) -> int:
+        """Derive how many ids a single query() page may safely carry.
 
-            if result and result.get("delete_count", 0) > 0:
-                logger.debug(
-                    f"[{self.workspace}] Successfully deleted {result.get('delete_count', 0)} vectors from {self.namespace}"
+        Rows carrying a vector dominate response size, so their page is
+        sized from the byte budget at the embedding dimension, capped by the
+        record count. Rows without a vector (``get_by_ids``) have no
+        estimable size here — ``content`` and ``source_id`` are each capped
+        only by MILVUS_MAX_VARCHAR_BYTES — so the record cap is used alone.
+        That cap is a heuristic rather than a byte-level guarantee; a page
+        that still overflows is caught and bisected by ``_query_rows_by_ids``
+        (see issue #3584 discussion).
+        """
+        if not includes_vector:
+            return MILVUS_QUERY_MAX_RECORDS_PER_BATCH
+
+        embedding_dim = self.embedding_func.embedding_dim
+        if embedding_dim <= 0:
+            return MILVUS_QUERY_MAX_RECORDS_PER_BATCH
+
+        row_bytes = embedding_dim * 4 + MILVUS_QUERY_ROW_OVERHEAD_BYTES
+        page_size = MILVUS_QUERY_MAX_RESPONSE_BYTES // row_bytes
+        return max(1, min(page_size, MILVUS_QUERY_MAX_RECORDS_PER_BATCH))
+
+    async def _query_rows_by_ids(
+        self,
+        ids: list[str],
+        output_fields: list[str],
+        *,
+        includes_vector: bool,
+    ) -> list[dict[str, Any]]:
+        """Fetch rows for `ids`, paging so no single query() response can
+        cross the gRPC message ceiling some gateways enforce.
+
+        A page that overflows anyway (the record cap bounds metadata rows by
+        count, not by bytes) is halved and retried, and the reduced size is
+        kept for the remaining pages so each of them does not have to fail
+        once first. Bisection stops at a single id: at that point a smaller
+        page is not available and the error is the caller's to see.
+
+        Every other error, and an overflow that survives down to one id,
+        propagates uncaught: a page failing partway through must not return
+        the pages that already succeeded, since callers treat an incomplete
+        result as a storage-consistency signal, not a partial one.
+        """
+        self._ensure_collection_loaded()
+
+        page_size = self._resolve_query_page_size(includes_vector=includes_vector)
+        rows: list[dict[str, Any]] = []
+        page_num = 0
+        start = 0
+        while start < len(ids):
+            page = ids[start : start + page_size]
+            id_list = '", "'.join(_escape_milvus_str(doc_id) for doc_id in page)
+            filter_expr = f'id in ["{id_list}"]'
+
+            try:
+                page_rows = self._client.query(
+                    collection_name=self.final_namespace,
+                    filter=filter_expr,
+                    output_fields=output_fields,
                 )
-            else:
-                logger.debug(
-                    f"[{self.workspace}] No vectors were deleted from {self.namespace}"
+            except Exception as e:
+                if len(page) == 1 or not self._is_response_too_large_error(e):
+                    raise
+                page_size = max(1, len(page) // 2)
+                logger.warning(
+                    f"[{self.workspace}] Milvus query response too large for "
+                    f"{len(page)} ids in {self.namespace}; retrying the page at "
+                    f"size {page_size}"
                 )
+                continue
 
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Error while deleting vectors from {self.namespace}: {e}"
-            )
+            rows.extend(page_rows or [])
+            start += len(page)
+            page_num += 1
+            # Each page is a blocking gRPC round-trip, so yield between pages
+            # rather than at the default 64-iteration cadence — that would
+            # need >16k ids before releasing the event loop once.
+            if start < len(ids):
+                await _cooperative_yield(page_num, every=1)
+
+        return rows
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
-        """Get vector data by its ID
+        """Get vector data by its ID, with read-your-writes against the buffer."""
+        async with self._flush_lock:
+            if id in self._pending_vector_deletes:
+                return None
+            pending = self._pending_vector_docs.get(id)
+            if pending is not None:
+                doc = dict(pending.source)
+                doc["id"] = id
+                return doc
 
-        Args:
-            id: The unique identifier of the vector
-
-        Returns:
-            The vector data if found, or None if not found
-        """
         try:
             # Ensure collection is loaded before querying
             self._ensure_collection_loaded()
@@ -1661,10 +2849,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Include all meta_fields (created_at is now always included) plus id
             output_fields = list(self.meta_fields) + ["id"]
 
-            # Query Milvus for a specific ID
             result = self._client.query(
                 collection_name=self.final_namespace,
-                filter=f'id == "{id}"',
+                filter=f'id == "{_escape_milvus_str(id)}"',
                 output_fields=output_fields,
             )
 
@@ -1679,118 +2866,226 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return None
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
-        """Get multiple vector data by their IDs
-
-        Args:
-            ids: List of unique identifiers
-
-        Returns:
-            List of vector data objects that were found
-        """
+        """Get multiple vector data by their IDs (read-your-writes), preserving order."""
         if not ids:
             return []
 
-        try:
-            # Ensure collection is loaded before querying
-            self._ensure_collection_loaded()
+        buffered: dict[str, dict[str, Any] | None] = {}
+        remaining: list[str] = []
+        async with self._flush_lock:
+            for doc_id in ids:
+                if doc_id in self._pending_vector_deletes:
+                    buffered[doc_id] = None
+                    continue
+                pending = self._pending_vector_docs.get(doc_id)
+                if pending is not None:
+                    doc = dict(pending.source)
+                    doc["id"] = doc_id
+                    buffered[doc_id] = doc
+                    continue
+                remaining.append(doc_id)
 
-            # Include all meta_fields (created_at is now always included) plus id
-            output_fields = list(self.meta_fields) + ["id"]
+        result_map: dict[str, dict[str, Any]] = {}
+        if remaining:
+            try:
+                # Include all meta_fields (created_at is now always included) plus id
+                output_fields = list(self.meta_fields) + ["id"]
 
-            # Prepare the ID filter expression
-            id_list = '", "'.join(ids)
-            filter_expr = f'id in ["{id_list}"]'
+                rows = await self._query_rows_by_ids(
+                    remaining, output_fields, includes_vector=False
+                )
 
-            # Query Milvus with the filter
-            result = self._client.query(
-                collection_name=self.final_namespace,
-                filter=filter_expr,
-                output_fields=output_fields,
-            )
-
-            if not result:
+                for row in rows:
+                    if not row:
+                        continue
+                    row_id = row.get("id")
+                    if row_id is not None:
+                        result_map[str(row_id)] = row
+            except Exception as e:
+                logger.error(
+                    f"[{self.workspace}] Error retrieving vector data for "
+                    f"{len(remaining)} IDs (sample: {remaining[:5]}): {e}"
+                )
                 return []
 
-            result_map: dict[str, dict[str, Any]] = {}
-            for row in result:
-                if not row:
-                    continue
-                row_id = row.get("id")
-                if row_id is not None:
-                    result_map[str(row_id)] = row
-
-            ordered_results: list[dict[str, Any] | None] = []
-            for requested_id in ids:
-                ordered_results.append(result_map.get(str(requested_id)))
-
-            return ordered_results
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Error retrieving vector data for IDs {ids}: {e}"
-            )
-            return []
+        return [
+            buffered[doc_id] if doc_id in buffered else result_map.get(str(doc_id))
+            for doc_id in ids
+        ]
 
     async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
-        """Get vectors by their IDs, returning only ID and vector data for efficiency
+        """Get vector embeddings for given IDs, with read-your-writes.
 
-        Args:
-            ids: List of unique identifiers
-
-        Returns:
-            Dictionary mapping IDs to their vector embeddings
-            Format: {id: [vector_values], ...}
+        Pending docs with `vector is None` trigger a lazy embed inside the
+        lock; the resulting vector is cached on the buffered `_PendingVectorDoc`
+        so the next flush won't re-embed the same content.
         """
         if not ids:
             return {}
 
+        result: dict[str, list[float]] = {}
+        remaining: list[str] = []
+        async with self._flush_lock:
+            docs_to_embed: list[tuple[str, _PendingVectorDoc]] = []
+            for doc_id in ids:
+                if doc_id in self._pending_vector_deletes:
+                    continue
+                pending = self._pending_vector_docs.get(doc_id)
+                if pending is not None:
+                    if pending.vector is None:
+                        docs_to_embed.append((doc_id, pending))
+                    else:
+                        result[doc_id] = pending.vector
+                    continue
+                remaining.append(doc_id)
+
+            if docs_to_embed:
+                contents = [pdoc.content for _, pdoc in docs_to_embed]
+                batches = [
+                    contents[i : i + self._max_batch_size]
+                    for i in range(0, len(contents), self._max_batch_size)
+                ]
+                try:
+                    embeddings_list = await asyncio.gather(
+                        *[
+                            self.embedding_func(batch, context="document")
+                            for batch in batches
+                        ]
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{self.workspace}] Error lazily embedding pending vectors "
+                        f"(upserts={len(docs_to_embed)}): {e}"
+                    )
+                    raise
+                embeddings = np.concatenate(embeddings_list)
+                if len(embeddings) != len(docs_to_embed):
+                    raise RuntimeError(
+                        f"[{self.workspace}] Embedding count mismatch: expected "
+                        f"{len(docs_to_embed)}, got {len(embeddings)}"
+                    )
+                for i, ((doc_id, pdoc), embedding) in enumerate(
+                    zip(docs_to_embed, embeddings), start=1
+                ):
+                    # Cache float32 to match the flush path so the buffered
+                    # vector dtype is uniform regardless of which path embedded.
+                    pdoc.vector = np.array(embedding, dtype=np.float32).tolist()
+                    result[doc_id] = pdoc.vector
+                    await _cooperative_yield(i)
+
+        if not remaining:
+            return result
+
         try:
-            # Ensure collection is loaded before querying
-            self._ensure_collection_loaded()
-
-            # Prepare the ID filter expression
-            id_list = '", "'.join(ids)
-            filter_expr = f'id in ["{id_list}"]'
-
-            # Query Milvus with the filter, requesting only vector field
-            result = self._client.query(
-                collection_name=self.final_namespace,
-                filter=filter_expr,
-                output_fields=["vector"],
+            rows = await self._query_rows_by_ids(
+                remaining, ["id", "vector"], includes_vector=True
             )
 
-            vectors_dict = {}
-            for item in result:
+            for item in rows:
                 if item and "vector" in item and "id" in item:
-                    # Convert numpy array to list if needed
                     vector_data = item["vector"]
                     if isinstance(vector_data, np.ndarray):
                         vector_data = vector_data.tolist()
-                    vectors_dict[item["id"]] = vector_data
-
-            return vectors_dict
+                    # Match get_by_ids: stringify the server-returned id so
+                    # callers can index the dict by the original requested id.
+                    result[str(item["id"])] = vector_data
+            return result
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error retrieving vectors by IDs from {self.namespace}: {e}"
             )
-            return {}
+            return result
+
+    async def finalize(self):
+        """Flush pending vector ops, then release the Milvus gRPC channel.
+
+        Every other server-backed storage releases its client here (Neo4j
+        driver, Postgres pool, Mongo client, OpenSearch ClientManager); the
+        MilvusClient owns a gRPC channel that should be closed explicitly
+        too — ``close()`` is already used for that purpose by
+        ``_rebuild_milvus_client``. We still fail loudly when a transient
+        bulk error left writes buffered — the caller must not believe
+        storage finalized cleanly.
+        """
+        flush_error: Exception | None = None
+        try:
+            await self._flush_pending_vector_ops()
+        except Exception as e:
+            flush_error = e
+
+        # Release the gRPC channel after the flush so the flush can still use
+        # the client. Best-effort: close() on a dead channel is a no-op (see
+        # _rebuild_milvus_client). The connection is freed on every exit path,
+        # matching the close-on-release pattern of the other server-backed
+        # storages (Neo4j / Postgres / Mongo / OpenSearch).
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception as close_error:
+                logger.warning(
+                    f"[{self.workspace}] Failed to close Milvus client: {close_error}"
+                )
+
+        # Read the residual buffer sizes under the flush lock so the
+        # snapshot is consistent with any racing late-arriving mutator
+        # (cancellation paths can land an upsert/delete between the flush
+        # above and the post-mortem check below).
+        async with self._flush_lock:
+            pending_docs = len(self._pending_vector_docs)
+            pending_deletes = len(self._pending_vector_deletes)
+
+        if flush_error is not None:
+            raise RuntimeError(
+                f"[{self.workspace}] MilvusVectorDBStorage.finalize() flush raised; "
+                f"{pending_docs} pending upserts and {pending_deletes} pending "
+                f"deletes were left buffered (data lost)"
+            ) from flush_error
+        if pending_docs or pending_deletes:
+            raise RuntimeError(
+                f"[{self.workspace}] MilvusVectorDBStorage.finalize() left "
+                f"{pending_docs} pending upserts and {pending_deletes} pending "
+                f"deletes buffered after final flush attempt (these writes have been lost)"
+            )
 
     async def drop(self) -> dict[str, str]:
-        """Drop all vector data from storage and clean up resources
+        """Drop all data from the Milvus collection. Destructive.
 
-        This method will delete all data from the Milvus collection.
+        MUST only be called when ``pipeline_status`` is idle (see the
+        Pipeline concurrency contract in ``AGENTS.md``); the only
+        in-tree caller ``clear_documents`` enforces this.
+
+        Caveat — only this instance's buffers are cleared. Other
+        ``MilvusVectorDBStorage`` instances aliased onto the same
+        ``final_namespace`` (multi-worker processes, or distinct
+        workspaces collapsed by ``MILVUS_WORKSPACE``) keep their own
+        buffers; a sibling whose prior flush failed and left buffers
+        intact will, on its next flush, upsert those stale rows into
+        the freshly recreated collection. Direct callers bypassing the
+        idle precondition MUST flush every aliased instance first.
 
         Returns:
-            dict[str, str]: Operation status and message
-            - On success: {"status": "success", "message": "data dropped"}
-            - On failure: {"status": "error", "message": "<error details>"}
+            dict[str, str]: ``{"status": "success"|"error", "message": str}``
         """
         try:
-            # Drop the collection and recreate it
-            if self._client.has_collection(self.final_namespace):
-                self._client.drop_collection(self.final_namespace)
+            async with self._flush_lock:
+                # Discard any buffered writes before the collection is gone;
+                # a concurrent flush would otherwise resurrect them.
+                self._pending_vector_docs.clear()
+                self._pending_vector_deletes.clear()
 
-            # Recreate the collection
-            self._create_collection_if_not_exist()
+                # Drop the collection and recreate it empty.
+                if self._client.has_collection(self.final_namespace):
+                    self._client.drop_collection(self.final_namespace)
+
+                # Recreate an EMPTY collection. Do NOT route through
+                # _create_collection_if_not_exist here: with the suffixed
+                # collection now gone it would see the intentionally-kept legacy
+                # collection and re-run the legacy->suffixed migration, pulling
+                # the just-dropped rows back in. That makes drop() non-empty
+                # (clear_documents would leave stale legacy data behind) and
+                # forces a needless full migration on every rebuild/clear.
+                self._create_collection_with_schema(self.final_namespace)
+                self._ensure_collection_loaded()
 
             logger.info(
                 f"[{self.workspace}] Process {os.getpid()} drop Milvus collection {self.namespace}"

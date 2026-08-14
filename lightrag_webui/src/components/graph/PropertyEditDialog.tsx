@@ -21,6 +21,7 @@ interface PropertyEditDialogProps {
   onAllowMergeChange: (allowMerge: boolean) => void
   isSubmitting?: boolean
   errorMessage?: string | null
+  disableSave?: boolean
 }
 
 /**
@@ -37,7 +38,8 @@ const PropertyEditDialog = ({
   onValueChange,
   onAllowMergeChange,
   isSubmitting = false,
-  errorMessage = null
+  errorMessage = null,
+  disableSave = false
 }: PropertyEditDialogProps) => {
   const { t } = useTranslation()
 
@@ -82,13 +84,6 @@ const PropertyEditDialog = ({
     }
   };
 
-  const handleSave = async () => {
-    const trimmedValue = value.trim()
-    if (trimmedValue !== '') {
-      await onSave()
-    }
-  }
-
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-md">
@@ -102,6 +97,13 @@ const PropertyEditDialog = ({
             {t('graphPanel.propertiesView.editPropertyDescription')}
           </DialogDescription>
         </DialogHeader>
+
+        {/* Pipeline busy banner: editing kept open with draft preserved, but save disabled */}
+        {disableSave && (
+          <div className="bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 border border-amber-400/60 px-3 py-2 rounded-md text-sm">
+            {t('graphPanel.propertiesView.editLockedByPipeline')}
+          </div>
+        )}
 
         {/* Display error message if save fails */}
         {errorMessage && (
@@ -164,8 +166,8 @@ const PropertyEditDialog = ({
           </Button>
           <Button
             type="button"
-            onClick={handleSave}
-            disabled={isSubmitting}
+            onClick={onSave}
+            disabled={isSubmitting || disableSave}
           >
             {isSubmitting ? (
               <>

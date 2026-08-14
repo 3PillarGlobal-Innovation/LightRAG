@@ -99,7 +99,7 @@
         "error": "Некоторые файлы не удалось загрузить"
       },
       "generalError": "Ошибка загрузки\n{{error}}",
-      "fileTypes": "Поддерживаемые типы: TXT, MD, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "Поддерживаемые типы: {{types}}",
       "fileUploader": {
         "singleFileLimit": "Нельзя загрузить более 1 файла за раз",
         "maxFilesLimit": "Нельзя загрузить более {{count}} файлов",
@@ -136,10 +136,20 @@
         "metadata": "Метаданные",
         "select": "Выбрать"
       },
+      "filters": {
+        "all": "Все",
+        "completed": "Завершено",
+        "parse": "Разбор",
+        "analyze": "Анализ",
+        "process": "Обработка",
+        "failed": "Ошибка"
+      },
       "status": {
         "all": "Все",
         "completed": "Завершено",
         "preprocessed": "Предобработано",
+        "parsing": "Разбор",
+        "analyzing": "Анализ",
         "processing": "Обработка",
         "pending": "Ожидание",
         "failed": "Ошибка"
@@ -167,7 +177,6 @@
     "pipelineStatus": {
       "title": "Статус конвейера",
       "busy": "Конвейер занят",
-      "requestPending": "Запрос ожидает",
       "cancellationRequested": "Запрошена отмена",
       "jobName": "Название задачи",
       "startTime": "Время начала",
@@ -191,6 +200,8 @@
   },
   "graphPanel": {
     "dataIsTruncated": "Данные графа обрезаны до максимального количества узлов",
+    "fetchRetriesExhausted": "Не удалось загрузить данные графа. Обновите страницу, чтобы повторить попытку.",
+    "graphBuildFailed": "Не удалось отобразить данные графа. Обновите страницу, чтобы повторить попытку.",
     "statusDialog": {
       "title": "Настройки сервера LightRAG",
       "description": "Просмотр текущего статуса системы и информации о подключении"
@@ -223,6 +234,9 @@
       "disease": "Болезнь",
       "drug": "Лекарство",
       "food": "Еда",
+      "table": "Таблица",
+      "drawing": "Рисунок",
+      "equation": "Уравнение",
       "other": "Другое"
     },
     "sideBar": {
@@ -236,13 +250,14 @@
         "showEdgeLabel": "Показать метки рёбер",
         "hideUnselectedEdges": "Скрыть невыбранные рёбра",
         "edgeEvents": "События рёбер",
+        "edgeEventsDisabledHint": "Отключено для графов с более чем {{count}} рёбрами",
         "maxQueryDepth": "Максимальная глубина запроса",
         "maxNodes": "Максимальное количество узлов",
-        "maxLayoutIterations": "Максимальное количество итераций раскладки",
         "resetToDefault": "Сбросить к значениям по умолчанию",
         "edgeSizeRange": "Диапазон размера рёбер",
         "depth": "Г",
-        "max": "Макс",
+        "node": "Узел",
+        "edge": "Ребро",
         "degree": "Степень",
         "apiKey": "API ключ",
         "enterYourAPIkey": "Введите ваш API ключ",
@@ -284,11 +299,12 @@
     "statusCard": {
       "unavailable": "Информация о статусе недоступна",
       "serverInfo": "Информация о сервере",
-      "workingDirectory": "Рабочая директория",
       "inputDirectory": "Входная директория",
-      "maxParallelInsert": "Параллельная обработка документов",
-      "summarySettings": "Настройки краткого содержания",
-      "llmConfig": "Конфигурация LLM",
+      "parser": "Парсер",
+      "mineru": "MinerU",
+      "docling": "Docling",
+      "otherSettings": "Другие настройки",
+      "llmConfig": "Конфигурация модели",
       "llmBinding": "Привязка LLM",
       "llmBindingHost": "Конечная точка LLM",
       "llmModel": "Модель LLM",
@@ -302,18 +318,18 @@
       "graphStorage": "Хранилище графа",
       "vectorStorage": "Векторное хранилище",
       "workspace": "Рабочее пространство",
-      "maxGraphNodes": "Максимальное количество узлов графа",
       "rerankerConfig": "Конфигурация ранжирования",
       "rerankerBindingHost": "Конечная точка ранжирования",
       "rerankerModel": "Модель ранжирования",
-      "lockStatus": "Статус блокировки",
-      "threshold": "Порог"
+      "lockStatus": "Статус блокировки"
     },
     "propertiesView": {
       "editProperty": "Редактировать {{property}}",
+      "editLockedByPipeline": "Конвейер занят; редактирование отключено",
       "editPropertyDescription": "Отредактируйте значение свойства в текстовой области ниже.",
       "errors": {
         "duplicateName": "Имя узла уже существует",
+        "invalidEntityName": "Введите допустимое имя узла",
         "updateFailed": "Не удалось обновить узел",
         "tryAgainLater": "Пожалуйста, попробуйте позже",
         "updateSuccessButMergeFailed": "Свойства обновлены, но слияние не удалось: {{error}}",
@@ -394,12 +410,25 @@
       "copyManualInstruction": "Пожалуйста, выберите и скопируйте текст вручную",
       "thinking": "Размышление...",
       "thinkingTime": "Время размышления {{time}}с",
-      "thinkingInProgress": "Размышление в процессе..."
+      "thinkingInProgress": "Размышление в процессе...",
+      "responseTime": "Время ответа {{time}}с",
+      "firstTokenTime": "Первый токен {{time}}с",
+      "progress": {
+        "extracting_keywords": "Извлечение ключевых слов...",
+        "retrieving_entities": "Поиск сущностей...",
+        "retrieving_relations": "Поиск отношений...",
+        "retrieving_chunks": "Поиск фрагментов...",
+        "reranking": "Переранжирование...",
+        "generating_response": "Генерация ответа..."
+      }
     },
     "retrieval": {
       "startPrompt": "Начните поиск, введя ваш запрос ниже",
+      "scrollToBottom": "К последнему сообщению",
       "clear": "Очистить",
       "send": "Отправить",
+      "stop": "Остановить",
+      "userTerminated": "Прервано пользователем — ответ может быть неполным",
       "placeholder": "Введите ваш запрос (Поддержка префикса: /<Режим запроса>)",
       "error": "Ошибка: Не удалось получить ответ",
       "queryModeError": "Поддерживаются только следующие режимы запроса: {{modes}}",
@@ -410,6 +439,7 @@
       "parametersDescription": "Настройте параметры вашего запроса",
       "queryMode": "Режим запроса",
       "queryModeTooltip": "Выберите стратегию поиска:\n• Naive: Традиционный поиск по вектору текстовых фрагментов\n• Local: Фокус на поиске сущностей\n• Global: Фокус на поиске связей\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: Пропустить поиск, отправить историю разговора и текущий вопрос в LLM",
+      "queryModeWarning": "Может снизить качество поиска",
       "queryModeOptions": {
         "naive": "Naive",
         "local": "Local",

@@ -7,10 +7,19 @@ import traceback
 from fastapi import APIRouter, Depends, Query, HTTPException, Request
 
 from lightrag import LightRAG
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from lightrag.base import DeletionResult
 from lightrag.utils import logger
-from ..utils_api import get_combined_auth_dependency
+from ..utils_api import get_combined_auth_dependency, internal_server_error
+from .document_routes import check_pipeline_busy_or_raise
+
+
+def _require_nonempty_entity_name(entity_name: str) -> str:
+    """Strip and reject blank names so create/update match delete routes."""
+    if not entity_name or not entity_name.strip():
+        raise ValueError("Entity name cannot be empty")
+    return entity_name.strip()
 
 
 class EntityUpdateRequest(BaseModel):
@@ -19,11 +28,32 @@ class EntityUpdateRequest(BaseModel):
     allow_rename: bool = False
     allow_merge: bool = False
 
+    @field_validator("entity_name", mode="after")
+    @classmethod
+    def validate_entity_name(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
+
+    @model_validator(mode="after")
+    def validate_rename_target_name(self) -> "EntityUpdateRequest":
+        # Rename payloads put the new name in updated_data["entity_name"].
+        if "entity_name" not in self.updated_data:
+            return self
+        new_name = self.updated_data["entity_name"]
+        if not isinstance(new_name, str):
+            raise ValueError("Entity name cannot be empty")
+        self.updated_data["entity_name"] = _require_nonempty_entity_name(new_name)
+        return self
+
 
 class RelationUpdateRequest(BaseModel):
     source_id: str
     target_id: str
     updated_data: Dict[str, Any]
+
+    @field_validator("source_id", "target_id", mode="after")
+    @classmethod
+    def validate_endpoint_names(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
 
 
 class EntityMergeRequest(BaseModel):
@@ -35,10 +65,20 @@ class EntityMergeRequest(BaseModel):
     )
     entity_to_change_into: str = Field(
         ...,
-        description="Target entity name that will receive all relationships from the source entities. This entity will be preserved.",
+        description="Target entity name that will receive all relationships from the source entities. An existing entity is preserved and merged; a missing target is created.",
         min_length=1,
         examples=["Elon Musk"],
     )
+
+    @field_validator("entities_to_change", mode="after")
+    @classmethod
+    def validate_entities_to_change(cls, entities: list[str]) -> list[str]:
+        return [_require_nonempty_entity_name(name) for name in entities]
+
+    @field_validator("entity_to_change_into", mode="after")
+    @classmethod
+    def validate_entity_to_change_into(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
 
 
 class EntityCreateRequest(BaseModel):
@@ -58,6 +98,30 @@ class EntityCreateRequest(BaseModel):
             }
         ],
     )
+
+    @field_validator("entity_name", mode="after")
+    @classmethod
+    def validate_entity_name(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
+
+
+class DeleteEntityRequest(BaseModel):
+    entity_name: str = Field(..., description="The name of the entity to delete.")
+
+    @field_validator("entity_name", mode="after")
+    @classmethod
+    def validate_entity_name(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
+
+
+class DeleteRelationRequest(BaseModel):
+    source_entity: str = Field(..., description="The name of the source entity.")
+    target_entity: str = Field(..., description="The name of the target entity.")
+
+    @field_validator("source_entity", "target_entity", mode="after")
+    @classmethod
+    def validate_entity_names(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
 
 
 class RelationCreateRequest(BaseModel):
@@ -84,6 +148,11 @@ class RelationCreateRequest(BaseModel):
             }
         ],
     )
+
+    @field_validator("source_entity", "target_entity", mode="after")
+    @classmethod
+    def validate_entity_names(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
 
 
 def create_graph_routes(get_rag, api_key: Optional[str] = None):
@@ -112,9 +181,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error getting graph labels: {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error getting graph labels: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.get("/graph/label/popular", dependencies=[Depends(combined_auth)])
     async def get_popular_labels(
@@ -137,9 +204,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error getting popular labels: {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error getting popular labels: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.get("/graph/label/search", dependencies=[Depends(combined_auth)])
     async def search_labels(
@@ -164,9 +229,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error searching labels with query '{q}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error searching labels: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.get("/graphs", dependencies=[Depends(combined_auth)])
     async def get_knowledge_graph(
@@ -203,9 +266,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error getting knowledge graph for label '{label}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error getting knowledge graph: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.get("/graph/entity/exists", dependencies=[Depends(combined_auth)])
     async def check_entity_exists(
@@ -227,9 +288,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error checking entity existence for '{name}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error checking entity existence: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/entity/edit", dependencies=[Depends(combined_auth)])
     async def update_entity(
@@ -244,7 +303,10 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         Args:
             request (EntityUpdateRequest): Request containing:
                 - entity_name (str): Name of the entity to update
-                - updated_data (Dict[str, Any]): Dictionary of properties to update
+                - updated_data (Dict[str, Any]): Properties to update. Only
+                  entity_name (rename target), entity_type, description,
+                  source_id and file_path are accepted, each as a string; any
+                  other key or a non-string value is rejected with 400.
                 - allow_rename (bool): Whether to allow entity renaming (default: False)
                 - allow_merge (bool): Whether to merge into existing entity when renaming
                                      causes name conflict (default: False)
@@ -369,6 +431,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
             }
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             result = await rag.aedit_entity(
                 entity_name=request.entity_name,
                 updated_data=request.updated_data,
@@ -411,6 +474,8 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
                 "data": entity_data,
                 "operation_summary": operation_summary,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error updating entity '{request.entity_name}': {str(ve)}"
@@ -419,9 +484,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error updating entity '{request.entity_name}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error updating entity: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/relation/edit", dependencies=[Depends(combined_auth)])
     async def update_relation(
@@ -430,12 +493,17 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         """Update a relation's properties in the knowledge graph
 
         Args:
-            request (RelationUpdateRequest): Request containing source ID, target ID and updated data
+            request (RelationUpdateRequest): Request containing source ID,
+                target ID and updated data. Only description, keywords,
+                source_id and file_path (strings) and weight (number) are
+                accepted in updated_data; any other key or a value of the wrong
+                shape is rejected with 400.
 
         Returns:
             Dict: Updated relation information
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             result = await rag.aedit_relation(
                 source_entity=request.source_id,
                 target_entity=request.target_id,
@@ -446,6 +514,8 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
                 "message": "Relation updated successfully",
                 "data": result,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error updating relation between '{request.source_id}' and '{request.target_id}': {str(ve)}"
@@ -456,9 +526,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
                 f"Error updating relation between '{request.source_id}' and '{request.target_id}': {str(e)}"
             )
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error updating relation: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/entity/create", dependencies=[Depends(combined_auth)])
     async def create_entity(
@@ -508,6 +576,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
             }
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             # Use the proper acreate_entity method which handles:
             # - Graph lock for concurrency
             # - Vector embedding creation in entities_vdb
@@ -517,12 +586,15 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
                 entity_name=request.entity_name,
                 entity_data=request.entity_data,
             )
+            created_entity_name = result.get("entity_name", request.entity_name)
 
             return {
                 "status": "success",
-                "message": f"Entity '{request.entity_name}' created successfully",
+                "message": f"Entity '{created_entity_name}' created successfully",
                 "data": result,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error creating entity '{request.entity_name}': {str(ve)}"
@@ -531,9 +603,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error creating entity '{request.entity_name}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error creating entity: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/relation/create", dependencies=[Depends(combined_auth)])
     async def create_relation(
@@ -595,6 +665,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
             }
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             # Use the proper acreate_relation method which handles:
             # - Graph lock for concurrency
             # - Entity existence validation
@@ -612,6 +683,8 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
                 "message": f"Relation created successfully between '{request.source_entity}' and '{request.target_entity}'",
                 "data": result,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error creating relation between '{request.source_entity}' and '{request.target_entity}': {str(ve)}"
@@ -622,9 +695,7 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
                 f"Error creating relation between '{request.source_entity}' and '{request.target_entity}': {str(e)}"
             )
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error creating relation: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/entities/merge", dependencies=[Depends(combined_auth)])
     async def merge_entities(
@@ -670,7 +741,8 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
 
         HTTP Status Codes:
             200: Entities merged successfully
-            400: Invalid request (e.g., empty entity list, target entity doesn't exist)
+            400: Invalid request (e.g., empty entity list, source entity doesn't exist,
+                 or a name is empty after normalization)
             500: Internal server error
 
         Example Request:
@@ -681,20 +753,26 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
             }
 
         Note:
-            - The target entity (entity_to_change_into) must exist in the knowledge graph
+            - The target entity may already exist or may be a new canonical name
             - Source entities will be permanently deleted after the merge
             - This operation cannot be undone, so verify entity names before merging
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             result = await rag.amerge_entities(
                 source_entities=request.entities_to_change,
                 target_entity=request.entity_to_change_into,
             )
+            merged_entity_name = result.get(
+                "entity_name", request.entity_to_change_into
+            )
             return {
                 "status": "success",
-                "message": f"Successfully merged {len(request.entities_to_change)} entities into '{request.entity_to_change_into}'",
+                "message": f"Successfully merged {len(request.entities_to_change)} entities into '{merged_entity_name}'",
                 "data": result,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error merging entities {request.entities_to_change} into '{request.entity_to_change_into}': {str(ve)}"
@@ -705,8 +783,85 @@ def create_graph_routes(get_rag, api_key: Optional[str] = None):
                 f"Error merging entities {request.entities_to_change} into '{request.entity_to_change_into}': {str(e)}"
             )
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error merging entities: {str(e)}"
+            raise internal_server_error(e)
+
+    @router.delete(
+        "/graph/entity/delete",
+        response_model=DeletionResult,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_entity(
+        request: DeleteEntityRequest, rag: LightRAG = Depends(_rag_dep)
+    ):
+        """
+        Delete an entity and all its relationships from the knowledge graph.
+
+        Args:
+            request (DeleteEntityRequest): The request body containing the entity name.
+
+        Returns:
+            DeletionResult: An object containing the outcome of the deletion process.
+
+        Raises:
+            HTTPException: If the entity is not found (404) or an error occurs (500).
+        """
+        try:
+            await check_pipeline_busy_or_raise(rag)
+            result = await rag.adelete_by_entity(entity_name=request.entity_name)
+            if result.status == "not_found":
+                raise HTTPException(status_code=404, detail=result.message)
+            if result.status == "fail":
+                raise HTTPException(status_code=500, detail=result.message)
+            # Set doc_id to empty string since this is an entity operation, not document
+            result.doc_id = ""
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            error_msg = f"Error deleting entity '{request.entity_name}': {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            raise internal_server_error(e)
+
+    @router.delete(
+        "/graph/relation/delete",
+        response_model=DeletionResult,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_relation(
+        request: DeleteRelationRequest, rag: LightRAG = Depends(_rag_dep)
+    ):
+        """
+        Delete a relationship between two entities from the knowledge graph.
+
+        Args:
+            request (DeleteRelationRequest): The request body containing the source and target entity names.
+
+        Returns:
+            DeletionResult: An object containing the outcome of the deletion process.
+
+        Raises:
+            HTTPException: If the relation is not found (404) or an error occurs (500).
+        """
+        try:
+            await check_pipeline_busy_or_raise(rag)
+            result = await rag.adelete_by_relation(
+                source_entity=request.source_entity,
+                target_entity=request.target_entity,
             )
+            if result.status == "not_found":
+                raise HTTPException(status_code=404, detail=result.message)
+            if result.status == "fail":
+                raise HTTPException(status_code=500, detail=result.message)
+            # Set doc_id to empty string since this is a relation operation, not document
+            result.doc_id = ""
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            error_msg = f"Error deleting relation from '{request.source_entity}' to '{request.target_entity}': {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            raise internal_server_error(e)
 
     return router

@@ -57,8 +57,17 @@ async def anthropic_complete_if_cache(
     enable_cot: bool = False,
     base_url: str | None = None,
     api_key: str | None = None,
+    image_inputs: list[Any] | None = None,
     **kwargs: Any,
 ) -> Union[str, AsyncIterator[str]]:
+    """Call Anthropic Messages API with LightRAG-compatible shims.
+
+    Structured output note:
+    - This adapter does not support OpenAI-style ``response_format`` JSON mode.
+    - If callers pass ``response_format``, it is stripped before the request.
+    - Deprecated ``keyword_extraction`` and ``entity_extraction`` booleans are
+      accepted only as compatibility shims; they emit warnings and are ignored.
+    """
     if history_messages is None:
         history_messages = []
     if enable_cot:
@@ -78,8 +87,30 @@ async def anthropic_complete_if_cache(
         logging.getLogger("anthropic").setLevel(logging.INFO)
 
     kwargs.pop("hashing_kv", None)
-    kwargs.pop("keyword_extraction", None)
+    # Anthropic Messages API has no JSON mode; drop legacy flags and
+    # response_format. Emit DeprecationWarning when the booleans were set.
+    if kwargs.pop("keyword_extraction", False):
+        warnings.warn(
+            "anthropic_complete_if_cache(keyword_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if kwargs.pop("entity_extraction", False):
+        warnings.warn(
+            "anthropic_complete_if_cache(entity_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    kwargs.pop("response_format", None)
     timeout = kwargs.pop("timeout", None)
+
+    # Require max_tokens; the Anthropic SDK errors if it's missing
+    kwargs.setdefault("max_tokens", 8192)
+    # Pop stream from kwargs so it doesn't leak into create_params;
+    # default to False (non-streaming) for consistency with other providers
+    stream = kwargs.pop("stream", False)
 
     anthropic_async_client = (
         AsyncAnthropic(
@@ -96,7 +127,26 @@ async def anthropic_complete_if_cache(
 
     messages: list[dict[str, Any]] = []
     messages.extend(history_messages)
-    messages.append({"role": "user", "content": prompt})
+    if image_inputs:
+        from lightrag.llm._vision_utils import normalize_image_inputs
+
+        normalized_images = normalize_image_inputs(image_inputs)
+        user_content: list[dict[str, Any]] = []
+        for img in normalized_images:
+            user_content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.mime_type,
+                        "data": img.base64_str,
+                    },
+                }
+            )
+        user_content.append({"type": "text", "text": prompt})
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": prompt})
 
     logger.debug("===== Sending Query to Anthropic LLM =====")
     logger.debug(f"Model: {model}   Base URL: {base_url}")
@@ -105,19 +155,37 @@ async def anthropic_complete_if_cache(
     verbose_debug(f"System prompt: {system_prompt}")
 
     try:
-        create_params = {"model": model, "messages": messages, "stream": True, **kwargs}
+        create_params = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            **kwargs,
+        }
         if system_prompt:
             create_params["system"] = system_prompt
         response = await anthropic_async_client.messages.create(**create_params)
-
+    except APITimeoutError as e:
+        # APITimeoutError subclasses APIConnectionError, so it must come first
+        # or it would be swallowed by the broader handler below.
+        logger.error(f"Anthropic API Timeout Error: {e}")
+        try:
+            await anthropic_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close Anthropic client: {close_error}")
+        raise
     except APIConnectionError as e:
         logger.error(f"Anthropic API Connection Error: {e}")
+        try:
+            await anthropic_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close Anthropic client: {close_error}")
         raise
     except RateLimitError as e:
         logger.error(f"Anthropic API Rate Limit Error: {e}")
-        raise
-    except APITimeoutError as e:
-        logger.error(f"Anthropic API Timeout Error: {e}")
+        try:
+            await anthropic_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close Anthropic client: {close_error}")
         raise
     except Exception as e:
         body = getattr(e, "body", None)
@@ -134,7 +202,30 @@ async def anthropic_complete_if_cache(
         logger.error(
             f"Anthropic API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
         )
+        try:
+            await anthropic_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close Anthropic client: {close_error}")
         raise
+    except BaseException:
+        # CancelledError (and other BaseExceptions) aren't caught above, yet a
+        # cancellation while awaiting create() — before we hold the response or
+        # stream — would otherwise leak the client. Close it, then re-raise the
+        # cancellation untouched (cooperative cancellation).
+        try:
+            await anthropic_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close Anthropic client: {close_error}")
+        raise
+
+    if not stream:
+        try:
+            return response.content[0].text
+        finally:
+            try:
+                await anthropic_async_client.close()
+            except Exception as close_error:
+                logger.warning(f"Failed to close Anthropic client: {close_error}")
 
     async def stream_response():
         try:
@@ -154,6 +245,26 @@ async def anthropic_complete_if_cache(
         except Exception as e:
             logger.error(f"Error in stream response: {str(e)}")
             raise
+        finally:
+            # Release the streaming response and the client. The generator owns
+            # the client lifetime, so the caller never closes it; finally also
+            # runs on GeneratorExit (early break) which the except clause above
+            # cannot catch. AsyncStream exposes close() (not aclose()).
+            #
+            # The client close lives in an outer finally so it still runs if
+            # response.close() is interrupted by CancelledError (a BaseException,
+            # not caught by `except Exception`) — otherwise task cancellation /
+            # client disconnect during stream teardown would leak the client.
+            try:
+                try:
+                    await response.close()
+                except Exception as close_error:
+                    logger.warning(f"Failed to close Anthropic stream: {close_error}")
+            finally:
+                try:
+                    await anthropic_async_client.close()
+                except Exception as close_error:
+                    logger.warning(f"Failed to close Anthropic client: {close_error}")
 
     return stream_response()
 

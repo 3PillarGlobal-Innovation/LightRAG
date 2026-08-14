@@ -71,11 +71,12 @@ Notes:
 | **workspace** | str | Workspace name for data isolation between different LightRAG Instances | |
 | **kv_storage** | `str` | Storage type for documents and text chunks. Supported types: `JsonKVStorage`,`PGKVStorage`,`RedisKVStorage`,`MongoKVStorage`,`OpenSearchKVStorage` | `JsonKVStorage` |
 | **vector_storage** | `str` | Storage type for embedding vectors. Supported types: `NanoVectorDBStorage`,`PGVectorStorage`,`MilvusVectorDBStorage`,`ChromaVectorDBStorage`,`FaissVectorDBStorage`,`MongoVectorDBStorage`,`QdrantVectorDBStorage`,`OpenSearchVectorDBStorage` | `NanoVectorDBStorage` |
-| **graph_storage** | `str` | Storage type for graph edges and nodes. Supported types: `NetworkXStorage`,`Neo4JStorage`,`PGGraphStorage`,`AGEStorage`,`OpenSearchGraphStorage` | `NetworkXStorage` |
+| **graph_storage** | `str` | Storage type for graph edges and nodes. Supported types: `NetworkXStorage`,`Neo4JStorage`,`PGGraphStorage`,`PGTableGraphStorage`,`AGEStorage`,`OpenSearchGraphStorage` | `NetworkXStorage` |
 | **doc_status_storage** | `str` | Storage type for documents process status. Supported types: `JsonDocStatusStorage`,`PGDocStatusStorage`,`MongoDocStatusStorage`,`OpenSearchDocStatusStorage` | `JsonDocStatusStorage` |
 | **chunk_token_size** | `int` | Maximum token size per chunk when splitting documents | `1200` |
 | **chunk_overlap_token_size** | `int` | Overlap token size between two chunks when splitting documents | `100` |
-| **tokenizer** | `Tokenizer` | The function used to convert text into tokens (numbers) and back using .encode() and .decode() functions following `TokenizerInterface` protocol. If you don't specify one, it will use the default Tiktoken tokenizer. | `TiktokenTokenizer` |
+| **embedding_chunk_overlap_token_size** | `int` | Overlap token size the embedding hard fallback borrows from the previous window when a chunk is still over the embedding model's context limit after chunking. Independent from `chunk_overlap_token_size` (some chunking strategies, e.g. V, deliberately zero that one out for unrelated reasons); `0` disables the fallback's overlap; negative values raise `ValueError` at construction. Configured by env var `EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE`. | `100` |
+| **tokenizer** | `Tokenizer` | The function used to convert text into tokens (numbers) and back using .encode() and .decode() functions following `TokenizerInterface` protocol. If you don't specify one, it will use the default Tiktoken tokenizer. An injected tokenizer must be safe to call concurrently from multiple threads and must survive `copy.deepcopy` — see [Injecting a custom tokenizer](#injecting-a-custom-tokenizer). | `TiktokenTokenizer` |
 | **tiktoken_model_name** | `str` | If you're using the default Tiktoken tokenizer, this is the name of the specific Tiktoken model to use. This setting is ignored if you provide your own tokenizer. | `gpt-4o-mini` |
 | **entity_extract_max_gleaning** | `int` | Number of loops in the entity extraction process, appending history messages | `1` |
 | **node_embedding_algorithm** | `str` | Algorithm for node embedding (currently not used) | `node2vec` |
@@ -87,13 +88,147 @@ Notes:
 | **llm_model_name** | `str` | LLM model name for generation | `meta-llama/Llama-3.2-1B-Instruct` |
 | **summary_context_size** | `int` | Maximum tokens send to LLM to generate summaries for entity relation merging | `10000`（configured by env var SUMMARY_CONTEXT_SIZE) |
 | **summary_max_tokens** | `int` | Maximum token size for entity/relation description | `500`（configured by env var SUMMARY_MAX_TOKENS) |
-| **llm_model_max_async** | `int` | Maximum number of concurrent asynchronous LLM processes | `4`（default value changed by env var MAX_ASYNC) |
+| **llm_model_max_async** | `int` | Maximum number of concurrent asynchronous LLM processes | `4`（default value changed by env var MAX_ASYNC_LLM; MAX_ASYNC is still accepted as a deprecated alias) |
 | **llm_model_kwargs** | `dict` | Additional parameters for LLM generation | |
 | **vector_db_storage_cls_kwargs** | `dict` | Additional parameters for vector database, like setting the threshold for nodes and relations retrieval | cosine_better_than_threshold: 0.2（default value changed by env var COSINE_THRESHOLD) |
 | **enable_llm_cache** | `bool` | If `TRUE`, stores LLM results in cache; repeated prompts return cached responses | `TRUE` |
 | **enable_llm_cache_for_entity_extract** | `bool` | If `TRUE`, stores LLM results in cache for entity extraction; Good for beginners to debug your application | `TRUE` |
-| **addon_params** | `dict` | Additional parameters, e.g., `{"language": "Simplified Chinese", "entity_types": ["organization", "person", "location", "event"]}`: sets example limit, entity/relation extraction output language | language: English` |
+| **addon_params** | `dict` | Runtime knobs for extraction prompts and chunking. See [addon_params](#addon_params). | Env-backed defaults from `SUMMARY_LANGUAGE`, `ENTITY_TYPE_PROMPT_FILE`, and `CHUNK_*` |
 | **embedding_cache_config** | `dict` | Configuration for question-answer caching. Contains three parameters: `enabled`: Boolean value to enable/disable cache lookup functionality. When enabled, the system will check cached responses before generating new answers. `similarity_threshold`: Float value (0-1), similarity threshold. When a new question's similarity with a cached question exceeds this threshold, the cached answer will be returned directly without calling the LLM. `use_llm_check`: Boolean value to enable/disable LLM similarity verification. When enabled, LLM will be used as a secondary check to verify the similarity between questions before returning cached answers. | Default: `{"enabled": False, "similarity_threshold": 0.95, "use_llm_check": False}` |
+
+
+## addon_params
+
+`addon_params` is a live configuration mapping on each `LightRAG` instance. LightRAG currently reads the fields below; unknown custom keys may remain in the dict, but core LightRAG behavior does not use them.
+
+### Supported Fields
+
+| Field | Value | Purpose |
+|---|---|---|
+| `language` | Non-empty string. Defaults to `SUMMARY_LANGUAGE`, then `English`. | Output language used in entity and relationship extraction, entity/relation summaries, keyword extraction, and multimodal analysis prompts. |
+| `entity_type_prompt_file` | `.yml` or `.yaml` file name only. Loaded from `${PROMPT_DIR:-./prompts}/entity_type`. | Loads an entity extraction prompt profile. The profile can define `entity_types_guidance`, `entity_extraction_examples`, and `entity_extraction_json_examples`. The active extraction mode must have matching examples: text mode needs `entity_extraction_examples`; JSON mode needs `entity_extraction_json_examples`. |
+| `entity_types_guidance` | Non-empty string. | Inline entity type guidance injected into extraction prompts. This overrides both the prompt profile file and the built-in default guidance. |
+| `chunker` | Dict with F/R/V/P chunking settings. | Runtime baseline for chunker parameters. Each document gets a slim `chunk_options` snapshot at enqueue time; later edits affect only future enqueues. |
+
+Compact `chunker` shape:
+
+```jsonc
+{
+  "chunk_token_size": 1200,
+  "fixed_token": {
+    "chunk_token_size": 1200,
+    "chunk_overlap_token_size": 100,
+    "split_by_character": null,
+    "split_by_character_only": false
+  },
+  "recursive_character": {
+    "chunk_token_size": 1200,
+    "chunk_overlap_token_size": 100,
+    "separators": ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+  },
+  "semantic_vector": {
+    "chunk_token_size": 1200,
+    "breakpoint_threshold_type": "percentile",
+    "breakpoint_threshold_amount": null,
+    "buffer_size": 1,
+    // env/SDK only (CHUNK_V_SENTENCE_SPLIT_REGEX); the REST chunking.params
+    // object rejects this key with 422 — see GHSA-32jh-39m7-8x84 (ReDoS)
+    "sentence_split_regex": "(?<=[.?!])\\s+|(?<=[。？！])"
+  },
+  "paragraph_semantic": {
+    "chunk_token_size": 2000,
+    "chunk_overlap_token_size": 100
+  }
+}
+```
+
+### Initialization
+
+When you create a `LightRAG` object, `addon_params` is normalized before storage initialization:
+
+- If `addon_params` is omitted, LightRAG builds defaults from `SUMMARY_LANGUAGE`, `ENTITY_TYPE_PROMPT_FILE`, and the chunker-related `CHUNK_*` environment variables.
+- If you pass a partial dict, missing `language`, `entity_type_prompt_file`, and `chunker` values are still backfilled from the same env-backed defaults.
+- `entity_type_prompt_file` and `entity_types_guidance` are resolved into a cached entity extraction prompt profile during construction.
+- `chunk_token_size` and `chunk_overlap_token_size` constructor arguments are overlaid into `addon_params["chunker"]` only for slots that were not already set by explicit `addon_params` or strategy-specific env vars.
+
+Example:
+
+```python
+rag = LightRAG(
+    working_dir=WORKING_DIR,
+    llm_model_func=llm_model_func,
+    embedding_func=embedding_func,
+    addon_params={
+        "language": "Chinese",
+        "entity_type_prompt_file": "entity_type_prompt.sample.yml",
+        "entity_types_guidance": "- Paper: academic papers, reports, and preprints",
+        "chunker": {
+            "chunk_token_size": 1000,
+            "recursive_character": {
+                "separators": ["\n\n", "\n", "。", "！", "？", " "]
+            }
+        },
+    },
+)
+await rag.initialize_storages()
+```
+
+### Updating After Creation
+
+`rag.addon_params` is an observable mapping. Top-level updates mark the derived prompt cache dirty; the cache is refreshed the next time LightRAG builds runtime config for extraction or query work.
+
+Update one field:
+
+```python
+rag.addon_params["language"] = "Chinese"
+rag.addon_params["entity_types_guidance"] = "- Dataset: structured research data"
+```
+
+Replace the whole mapping:
+
+```python
+rag.addon_params = {
+    "language": "German",
+    "entity_type_prompt_file": "domain_profile.yml",
+}
+```
+
+Replacing `rag.addon_params` creates a new observable mapping. If you kept an old reference, discard it and re-read `rag.addon_params` before making more changes.
+
+Change F-strategy fixed-token splitting defaults for future documents:
+
+```python
+rag.addon_params["chunker"]["fixed_token"]["split_by_character"] = "\n\n"
+rag.addon_params["chunker"]["fixed_token"]["split_by_character_only"] = True
+```
+
+`split_by_character` pre-splits text by the given separator before token-window chunking. When `split_by_character_only` is `True`, an oversized segment raises an error instead of being split again by token size.
+
+Change R-strategy recursive splitting defaults for future documents:
+
+```python
+rag.addon_params["chunker"]["recursive_character"]["separators"] = [
+    "\n\n",
+    "\n",
+    "###",
+    "。",
+    "！",
+    "？",
+    " ",
+]
+```
+
+Nested `chunker` edits are read when future documents are enqueued. Documents already enqueued keep their persisted `chunk_options` snapshot.
+
+`semantic_vector.sentence_split_regex` is the one exception: it is re-read from `addon_params` (seeded by `CHUNK_V_SENTENCE_SPLIT_REGEX`) on **every** processing run, and any value inside a persisted `chunk_options` snapshot is discarded and logged at WARNING. This also applies to an explicit `chunk_options=` passed to `apipeline_enqueue_documents` — a per-document splitter pattern is not supported. The pattern is applied by `re.split` to the document body while CPython holds the GIL, so an untrusted one can freeze the whole worker process; see [GHSA-32jh-39m7-8x84](https://github.com/HKUDS/LightRAG/security/advisories/GHSA-32jh-39m7-8x84).
+
+### Notes and Precedence
+
+- Entity type guidance precedence is: `addon_params["entity_types_guidance"]` > `entity_type_prompt_file` profile > built-in default guidance.
+- Chunker precedence is: explicit `addon_params["chunker"]` values > strategy-specific `CHUNK_*` env vars > legacy constructor fields (`chunk_token_size`, `chunk_overlap_token_size`) > legacy env vars (`CHUNK_SIZE`, `CHUNK_OVERLAP_SIZE`).
+- Per-strategy `chunk_token_size`: every strategy reads `chunk_token_size` from its own sub-dict first and falls back to the top-level `chunk_token_size` when its sub-dict doesn't set one. F, R, and V can each seed their sub-dict value from a dedicated env var (`CHUNK_F_SIZE` / `CHUNK_R_SIZE` / `CHUNK_V_SIZE`) or set it explicitly in `addon_params`; when neither is set they inherit the top-level value.
+- `paragraph_semantic.chunk_token_size` is the exception: unlike F/R/V it never inherits the top-level `chunk_token_size`; if not explicit it uses `CHUNK_P_SIZE`, then the built-in default `2000`.
+- `enable_multimodal_pipeline` is deprecated and ignored if passed in `addon_params`. Use per-document `process_options` such as `i`, `t`, and `e` to control multimodal processing.
 
 
 ## QueryParam
@@ -146,12 +281,6 @@ class QueryParam:
     conversation_history: list[dict[str, str]] = field(default_factory=list)
     """Stores past conversation history to maintain context.
     Format: [{"role": "user/assistant", "content": "message"}].
-    """
-
-    model_func: Callable[..., object] | None = None
-    """Optional override for the LLM model function to use for this specific query.
-    If provided, this will be used instead of the global model function.
-    This allows using different models for different query modes.
     """
 
     user_prompt: str | None = None
@@ -440,6 +569,45 @@ To enhance retrieval quality, documents can be re-ranked based on a more effecti
 
 Inject one of these functions into the `rerank_model_func` attribute of the LightRAG object. For detailed usage, refer to `examples/rerank_example.py`.
 
+### Injecting a Custom Tokenizer
+
+Any object with `encode(str) -> list[int]` and `decode(list[int]) -> str` can be
+wrapped in `Tokenizer` and passed as `tokenizer=`. Two requirements apply:
+
+1. **It must be safe to call concurrently from multiple threads.** Token counting
+   is CPU-bound, so LightRAG runs it in worker threads to keep the asyncio event
+   loop responsive; several of them may enter your `encode`/`decode` at once.
+   LightRAG deliberately does not serialize calls on your behalf — a lock owned
+   by LightRAG would end up being waited on by the event loop behind a worker
+   thread, which is exactly the stall the threading is there to avoid.
+2. **It must survive `copy.deepcopy`.** `LightRAG` is a dataclass and builds its
+   internal config with `dataclasses.asdict`, which deep-copies non-dataclass
+   fields.
+
+The two interact: if you achieve thread safety with an internal `threading.Lock`,
+deep-copying it raises `TypeError: cannot pickle '_thread.lock' object`. Declare
+`__deepcopy__` returning `self`, which is sound precisely because a thread-safe
+tokenizer is safe to share:
+
+```python
+class MyTokenizer:
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __deepcopy__(self, memo):
+        return self  # thread-safe, therefore shareable
+
+    def encode(self, content: str) -> list[int]: ...
+    def decode(self, tokens: list[int]) -> str: ...
+
+rag = LightRAG(..., tokenizer=Tokenizer("my-model", MyTokenizer()))
+```
+
+The built-in `TiktokenTokenizer` satisfies both. Note that copying it is not a
+way to get isolation: `tiktoken` caches encodings in a process-wide registry, so
+every `TiktokenTokenizer` for a given model — copies included — resolves to the
+same underlying BPE engine.
+
 ### User Prompt vs. Query
 
 When using LightRAG for content queries, avoid combining the search process with unrelated output processing, as this significantly impacts query effectiveness. The `user_prompt` parameter in `QueryParam` does not participate in the RAG retrieval phase — it guides the LLM on how to process the retrieved results after the query is completed.
@@ -487,11 +655,18 @@ OpenSearchKVStorage  OpenSearch
 NetworkXStorage          NetworkX (default)
 Neo4JStorage             Neo4J
 PGGraphStorage           PostgreSQL with AGE plugin
+PGTableGraphStorage      PostgreSQL, plain tables (no AGE, no extensions)
 MemgraphStorage          Memgraph
 OpenSearchGraphStorage   OpenSearch
 ```
 
 > Testing has shown that Neo4J delivers superior performance in production environments compared to PostgreSQL with AGE plugin.
+>
+> `PGTableGraphStorage` implements the graph layer on ordinary indexed tables plus
+> JSONB, so it runs on any stock PostgreSQL 14+ — including managed instances
+> (RDS, Cloud SQL, Supabase, Neon) where the AGE extension cannot be installed.
+> It shares the same `POSTGRES_*` configuration and connection pool as the other
+> PG storages. Choose `PGGraphStorage` only if you specifically need AGE/Cypher.
 
 **VECTOR_STORAGE**
 ```
@@ -546,10 +721,11 @@ See `test_neo4j.py` for a working example.
 
 #### Using PostgreSQL Storage
 
-PostgreSQL can provide a one-stop solution as KV store, VectorDB (pgvector), and GraphDB (apache AGE). PostgreSQL version 16.6 or higher is supported.
+PostgreSQL can provide a one-stop solution as KV store, VectorDB (pgvector), and GraphDB (`PGTableGraphStorage` on plain indexed tables, or `PGGraphStorage` on Apache AGE). PostgreSQL version 16.6 or higher is supported.
 
 - PostgreSQL is lightweight; the whole binary distribution including all necessary plugins can be zipped to 40MB: Ref to [Windows Release](https://github.com/ShanGor/apache-age-windows/releases/tag/PG17%2Fv1.5.0-rc0) as it is easy to install for Linux/Mac.
-- If you prefer Docker, start with this image to avoid hiccups (Default user password: rag/rag): https://hub.docker.com/r/gzdaniel/postgres-for-rag
+- If you prefer Docker and graph storage is `PGTableGraphStorage` (the recommended choice, which needs no Apache AGE), the official pgvector image `pgvector/pgvector:pg18` is all you need.
+- Only `PGGraphStorage` requires an AGE-bundled image; to avoid hiccups there, start with https://hub.docker.com/r/gzdaniel/postgres-for-rag (published for `linux/amd64` and `linux/arm64`). The latest image no longer ships hardcoded credentials; on first start it creates the user, password, and database from the `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` environment variables (these are set automatically when you deploy via the `scripts/setup/setup.sh` wizard, so you can pick any values).
 - How to start: see [examples/lightrag_gemini_postgres_demo.py](https://github.com/HKUDS/LightRAG/blob/main/examples/lightrag_gemini_postgres_demo.py)
 - For high-performance graph database requirements, Neo4j is recommended as Apache AGE's performance is not as competitive.
 
@@ -710,7 +886,7 @@ curl -sk -u admin:<custom-admin-password> https://localhost:9200/_cat/plugins?v
 
 3. Run unit tests (no OpenSearch required — uses mocks):
 ```bash
-python -m pytest tests/test_opensearch_storage.py -v
+python -m pytest tests/kg/opensearch_impl/test_opensearch_storage.py -v
 ```
 
 4. Run the OpenSearch storage demo:
@@ -753,7 +929,7 @@ The `workspace` parameter ensures data isolation between different LightRAG inst
 | `JsonKVStorage`, `JsonDocStatusStorage`, `NetworkXStorage`, `NanoVectorDBStorage`, `FaissVectorDBStorage` | Workspace subdirectories |
 | `RedisKVStorage`, `MilvusVectorDBStorage`, `MongoKVStorage`, `MongoVectorDBStorage`, `MongoGraphStorage`, `PGGraphStorage` | Workspace prefix on collection name |
 | `QdrantVectorDBStorage` | Payload-based partitioning (Qdrant multitenancy) |
-| `PGKVStorage`, `PGVectorStorage`, `PGDocStatusStorage` | `workspace` field in tables |
+| `PGKVStorage`, `PGVectorStorage`, `PGDocStatusStorage`, `PGTableGraphStorage` | `workspace` field in tables |
 | `Neo4JStorage` | Labels |
 | `OpenSearch*` | Index name prefixes |
 
@@ -787,7 +963,7 @@ rag = LightRAG(
 rag.insert(["TEXT1", "TEXT2", "TEXT3", ...])  # Processed in batches of 4
 ```
 
-The `max_parallel_insert` parameter determines the number of documents processed concurrently. Default is **2**. Recommended to keep **below 10**, as the bottleneck typically lies with the LLM.
+The `max_parallel_insert` parameter determines the number of documents processed concurrently. Default is **3**. Recommended to keep **below 10**, as the bottleneck typically lies with the LLM.
 
 * Insert with ID
 
@@ -884,6 +1060,16 @@ updated_relation = rag.edit_relation("Google", "Google Mail", {
     "weight": 3.0
 })
 ```
+
+Entity names supplied to `create_entity` and new names supplied during
+`edit_entity` renames use the same normalization rules as extracted entity
+names. When editing an existing entity, LightRAG first preserves an exact
+legacy name match and otherwise falls back to the normalized name.
+`insert_custom_kg` applies the same rules to declared entity names and both
+endpoints of every relationship before writing any custom KG data.
+`merge_entities` resolves existing exact legacy source/target names first and
+otherwise uses normalized names. The target may be an existing entity or a
+new normalized name created by the merge.
 
 All operations are available in both synchronous and asynchronous versions. Async versions have the prefix "a" (e.g., `acreate_entity`, `aedit_relation`).
 

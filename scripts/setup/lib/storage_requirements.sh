@@ -3,37 +3,38 @@
 
 declare -ag KV_STORAGE_OPTIONS=(
   "JsonKVStorage"
-  "RedisKVStorage"
   "PGKVStorage"
   "MongoKVStorage"
   "OpenSearchKVStorage"
+  "RedisKVStorage"
 )
 
 declare -ag GRAPH_STORAGE_OPTIONS=(
   "NetworkXStorage"
+  "PGTableGraphStorage"
+  "MongoGraphStorage"
+  "OpenSearchGraphStorage"
+  "MemgraphStorage"
   "Neo4JStorage"
   "PGGraphStorage"
-  "MongoGraphStorage"
-  "MemgraphStorage"
-  "OpenSearchGraphStorage"
 )
 
 declare -ag VECTOR_STORAGE_OPTIONS=(
   "NanoVectorDBStorage"
-  "MilvusVectorDBStorage"
   "PGVectorStorage"
-  "FaissVectorDBStorage"
-  "QdrantVectorDBStorage"
   "MongoVectorDBStorage"
   "OpenSearchVectorDBStorage"
+  "MilvusVectorDBStorage"
+  "FaissVectorDBStorage"
+  "QdrantVectorDBStorage"
 )
 
 declare -ag DOC_STATUS_STORAGE_OPTIONS=(
   "JsonDocStatusStorage"
-  "RedisDocStatusStorage"
   "PGDocStatusStorage"
   "MongoDocStatusStorage"
   "OpenSearchDocStatusStorage"
+  "RedisDocStatusStorage"
 )
 
 declare -Ag STORAGE_ENV_REQUIREMENTS=(
@@ -47,6 +48,7 @@ declare -Ag STORAGE_ENV_REQUIREMENTS=(
   ["MongoGraphStorage"]="MONGO_URI MONGO_DATABASE"
   ["MemgraphStorage"]="MEMGRAPH_URI"
   ["PGGraphStorage"]="POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DATABASE"
+  ["PGTableGraphStorage"]="POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DATABASE"
   ["OpenSearchGraphStorage"]="OPENSEARCH_HOSTS OPENSEARCH_USER OPENSEARCH_PASSWORD"
   ["NanoVectorDBStorage"]=""
   ["MilvusVectorDBStorage"]="MILVUS_URI MILVUS_DB_NAME"
@@ -71,6 +73,7 @@ declare -Ag STORAGE_DB_TYPES=(
   ["RedisDocStatusStorage"]="redis"
   ["PGKVStorage"]="postgresql"
   ["PGGraphStorage"]="postgresql"
+  ["PGTableGraphStorage"]="postgresql"
   ["PGVectorStorage"]="postgresql"
   ["PGDocStatusStorage"]="postgresql"
   ["Neo4JStorage"]="neo4j"
