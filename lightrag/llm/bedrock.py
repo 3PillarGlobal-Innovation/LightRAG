@@ -23,7 +23,7 @@ if sys.version_info < (3, 9):
     from typing import AsyncIterator
 else:
     from collections.abc import AsyncIterator
-from typing import Union
+from typing import Any, Union
 
 # Import botocore exceptions for proper exception handling
 try:
@@ -132,6 +132,19 @@ def _handle_bedrock_exception(e: Exception, operation: str = "Bedrock API") -> N
         raise BedrockError(f"Unexpected error: {error_message}")
 
 
+def _record_converse_usage(token_tracker: Any | None, usage: dict | None) -> None:
+    """Feed a Converse ``usage`` block into LightRAG's TokenTracker, if any."""
+    if token_tracker is None or not usage:
+        return
+    token_tracker.add_usage(
+        {
+            "prompt_tokens": usage.get("inputTokens", 0),
+            "completion_tokens": usage.get("outputTokens", 0),
+            "total_tokens": usage.get("totalTokens", 0),
+        }
+    )
+
+
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=4, max=60),
@@ -150,8 +163,17 @@ async def bedrock_complete_if_cache(
     aws_access_key_id=None,
     aws_secret_access_key=None,
     aws_session_token=None,
+    token_tracker: Any | None = None,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
+    """Call a Bedrock model through the Converse API.
+
+    ``token_tracker`` is the usage sink LightRAG injects into every LLM call
+    (``lightrag/utils.py``). It is declared explicitly so it never reaches
+    ``converse(**kwargs)`` — botocore rejects unknown parameters — and so the
+    ``usage`` block Bedrock returns (``inputTokens`` / ``outputTokens`` /
+    ``totalTokens``) is recorded the same way the OpenAI binding records it.
+    """
     if enable_cot:
         import logging
 
@@ -255,9 +277,12 @@ async def bedrock_complete_if_cache(
                         text = delta.get("text")
                         if text:
                             yield text
-                    # Handle other event types that might indicate stream end
-                    elif "messageStop" in event:
-                        break
+                    # Bedrock emits ``metadata`` (with ``usage``) after
+                    # ``messageStop``, so keep consuming past the stop event.
+                    elif "metadata" in event:
+                        _record_converse_usage(
+                            token_tracker, event["metadata"].get("usage")
+                        )
 
             except Exception as e:
                 # Try to clean up resources if possible
@@ -328,6 +353,7 @@ async def bedrock_complete_if_cache(
             if not content or content.strip() == "":
                 raise BedrockError("Received empty content from Bedrock API")
 
+            _record_converse_usage(token_tracker, response.get("usage"))
             return content
 
         except Exception as e:
@@ -369,7 +395,16 @@ async def bedrock_embed(
     aws_access_key_id=None,
     aws_secret_access_key=None,
     aws_session_token=None,
+    token_tracker: Any | None = None,
 ) -> np.ndarray:
+    """Embed ``texts`` with a Bedrock embedding model.
+
+    ``token_tracker`` receives the summed ``inputTextTokenCount`` Titan
+    reports per request, so embedding usage on this binding is accounted for
+    like it is on the OpenAI binding. Cohere responses carry no token count
+    in the body, so nothing is recorded for them.
+    """
+    input_tokens = 0
     # Respect existing env; only set if a non-empty value is available
     access_key = os.environ.get("AWS_ACCESS_KEY_ID") or aws_access_key_id
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or aws_secret_access_key
@@ -425,6 +460,7 @@ async def bedrock_embed(
                             )
 
                         embed_texts.append(embedding)
+                        input_tokens += response_body.get("inputTextTokenCount", 0)
 
                     except Exception as e:
                         # Convert to appropriate exception type
@@ -478,6 +514,14 @@ async def bedrock_embed(
             if not embed_texts:
                 raise BedrockError("No embeddings generated")
 
+            if token_tracker is not None and input_tokens:
+                token_tracker.add_usage(
+                    {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": 0,
+                        "total_tokens": input_tokens,
+                    }
+                )
             return np.array(embed_texts)
 
         except Exception as e:
