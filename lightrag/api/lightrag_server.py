@@ -971,6 +971,8 @@ def create_app(args):
                     kwargs = {"texts": texts}
                     if model:
                         kwargs["model"] = model
+                    if token_tracker is not None:
+                        kwargs["token_tracker"] = token_tracker
                     return await actual_func(**kwargs)
                 elif binding == "jina":
                     from lightrag.llm.jina import jina_embed
