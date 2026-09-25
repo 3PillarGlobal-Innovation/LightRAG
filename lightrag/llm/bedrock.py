@@ -514,14 +514,23 @@ async def bedrock_embed(
             if not embed_texts:
                 raise BedrockError("No embeddings generated")
 
-            if token_tracker is not None and input_tokens:
-                token_tracker.add_usage(
-                    {
-                        "prompt_tokens": input_tokens,
-                        "completion_tokens": 0,
-                        "total_tokens": input_tokens,
-                    }
-                )
+            if token_tracker is not None:
+                if input_tokens:
+                    token_tracker.add_usage(
+                        {
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": 0,
+                            "total_tokens": input_tokens,
+                        }
+                    )
+                else:
+                    # Make silent under-accounting visible: Cohere responses
+                    # carry no token count, and a Titan response without
+                    # inputTextTokenCount would land here too.
+                    logging.debug(
+                        f"Bedrock embedding with {model} reported no input token "
+                        "count; nothing recorded on the token tracker."
+                    )
             return np.array(embed_texts)
 
         except Exception as e:

@@ -43,9 +43,10 @@ class _FakeBedrockClient:
         "guardrailConfig",
     }
 
-    def __init__(self, stream_events=None):
+    def __init__(self, stream_events=None, report_embed_tokens=True):
         self.calls = []
         self._stream_events = stream_events or []
+        self._report_embed_tokens = report_embed_tokens
 
     def _validate(self, kwargs):
         unknown = set(kwargs) - self._CONVERSE_PARAMS
@@ -81,11 +82,10 @@ class _FakeBedrockClient:
     async def invoke_model(self, **kwargs):
         self.calls.append(("invoke_model", kwargs))
         text = json.loads(kwargs["body"])["inputText"]
-        return {
-            "body": _FakeBody(
-                {"embedding": [0.1] * 1024, "inputTextTokenCount": len(text.split())}
-            )
-        }
+        payload = {"embedding": [0.1] * 1024}
+        if self._report_embed_tokens:
+            payload["inputTextTokenCount"] = len(text.split())
+        return {"body": _FakeBody(payload)}
 
     # aioboto3's ``session.client(...)`` is used both as an async context
     # manager and via explicit ``__aenter__`` / ``__aexit__`` in the stream path.
@@ -204,3 +204,25 @@ async def test_embed_absorbs_token_tracker_and_sums_titan_input_tokens(fake_clie
 async def test_embed_without_tracker_records_nothing(fake_client):
     vectors = await bedrock_embed(["one"], model="amazon.titan-embed-text-v2:0")
     assert vectors.shape == (1, 1024)
+
+
+@pytest.mark.offline
+async def test_embed_logs_when_tracker_present_but_no_token_count(monkeypatch, caplog):
+    """A response without a token count must not be silent under-accounting:
+    nothing is recorded, and a debug line says so."""
+    client = _FakeBedrockClient(report_embed_tokens=False)
+    monkeypatch.setattr(
+        bedrock_module.aioboto3, "Session", lambda: _FakeSession(client)
+    )
+    tracker = TokenTracker()
+
+    with caplog.at_level("DEBUG"):
+        vectors = await bedrock_embed(
+            ["one"], model="amazon.titan-embed-text-v2:0", token_tracker=tracker
+        )
+
+    assert vectors.shape == (1, 1024)
+    assert tracker.call_count == 0
+    assert any(
+        "reported no input token count" in r.getMessage() for r in caplog.records
+    )
