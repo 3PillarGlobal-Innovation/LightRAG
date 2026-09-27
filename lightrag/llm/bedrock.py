@@ -231,14 +231,23 @@ async def bedrock_complete_if_cache(
         "top_p": "topP",
         "stop_sequences": "stopSequences",
     }
-    if inference_params := list(
-        set(kwargs) & set(["max_tokens", "temperature", "top_p", "stop_sequences"])
-    ):
-        args["inferenceConfig"] = {}
-        for param in inference_params:
-            args["inferenceConfig"][inference_params_map.get(param, param)] = (
-                kwargs.pop(param)
-            )
+    inference_config: dict[str, Any] = {}
+    for param in ("max_tokens", "temperature", "top_p", "stop_sequences"):
+        if param not in kwargs:
+            continue
+        value = kwargs.pop(param)
+        # Bedrock rejects None; a None default means "inherit provider default"
+        if value is None:
+            continue
+        inference_config[inference_params_map.get(param, param)] = value
+    if inference_config:
+        args["inferenceConfig"] = inference_config
+
+    # Pass-through for model-specific parameters (e.g. Anthropic reasoning_config,
+    # Nova inferenceConfig extensions). Mirrors OpenAI's `extra_body`.
+    extra_fields = kwargs.pop("extra_fields", None)
+    if extra_fields:
+        args["additionalModelRequestFields"] = extra_fields
 
     # Import logging for error handling
     import logging

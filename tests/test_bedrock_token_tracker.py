@@ -41,6 +41,7 @@ class _FakeBedrockClient:
         "inferenceConfig",
         "toolConfig",
         "guardrailConfig",
+        "additionalModelRequestFields",
     }
 
     def __init__(self, stream_events=None, report_embed_tokens=True):
