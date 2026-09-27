@@ -44,10 +44,15 @@ class _FakeBedrockClient:
         "additionalModelRequestFields",
     }
 
-    def __init__(self, stream_events=None, report_embed_tokens=True):
+    def __init__(
+        self, stream_events=None, report_embed_tokens=True, converse_content=None
+    ):
         self.calls = []
         self._stream_events = stream_events or []
         self._report_embed_tokens = report_embed_tokens
+        self._converse_content = (
+            [{"text": "hello"}] if converse_content is None else converse_content
+        )
 
     def _validate(self, kwargs):
         unknown = set(kwargs) - self._CONVERSE_PARAMS
@@ -66,7 +71,7 @@ class _FakeBedrockClient:
         self._validate(kwargs)
         self.calls.append(("converse", kwargs))
         return {
-            "output": {"message": {"content": [{"text": "hello"}]}},
+            "output": {"message": {"content": self._converse_content}},
             "usage": {"inputTokens": 11, "outputTokens": 7, "totalTokens": 18},
         }
 
