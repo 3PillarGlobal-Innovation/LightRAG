@@ -98,6 +98,7 @@ class LLMConfigCache:
 
         # Initialize configurations based on binding conditions
         self.openai_llm_options = None
+        self.bedrock_llm_options = None
         self.gemini_llm_options = None
         self.gemini_embedding_options = None
         self.ollama_llm_options = None
@@ -115,6 +116,12 @@ class LLMConfigCache:
 
             self.gemini_llm_options = GeminiLLMOptions.options_dict(args)
             logger.info(f"Gemini LLM Options: {self.gemini_llm_options}")
+
+        if args.llm_binding == "aws_bedrock":
+            from lightrag.llm.binding_options import BedrockLLMOptions
+
+            self.bedrock_llm_options = BedrockLLMOptions.options_dict(args)
+            logger.info(f"Bedrock LLM Options: {self.bedrock_llm_options}")
 
         # Only initialize and log Ollama LLM options when using Ollama LLM binding
         if args.llm_binding == "ollama":
@@ -1122,8 +1129,17 @@ def create_app(args):
         if history_messages is None:
             history_messages = []
 
-        # Use global temperature for Bedrock
-        kwargs["temperature"] = get_env_value("BEDROCK_LLM_TEMPERATURE", 1.0, float)
+        # Only the inference parameters an operator actually configured. An
+        # unset option is absent from the Namespace (argparse.SUPPRESS), so it
+        # never reaches the Converse request -- reasoning-tier models reject
+        # inferenceConfig fields such as temperature rather than ignoring them.
+        # Caller-supplied kwargs win over the server-wide configuration -- the
+        # opposite of create_optimized_openai_llm_func, which applies its options
+        # with kwargs.update() and so lets the server override the caller. This
+        # follows the upstream Bedrock path; no core call site passes any of these
+        # keys today, so the two orderings are observationally identical for now.
+        if config_cache.bedrock_llm_options:
+            kwargs = {**config_cache.bedrock_llm_options, **kwargs}
 
         return await bedrock_complete_if_cache(
             args.llm_model,
