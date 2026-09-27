@@ -574,7 +574,9 @@ class OpenAILLMOptions(BindingOptions):
 # Bedrock binding options map to the subset of the Bedrock Converse API
 # inferenceConfig that LightRAG's bedrock driver actually forwards. See
 # ``lightrag/llm/bedrock.py`` for the whitelist -- any field added here that is
-# not in that whitelist will be silently dropped by the driver.
+# not in that whitelist will be silently dropped by the driver, the one
+# exception being ``extra_fields``, which the driver forwards separately as
+# ``additionalModelRequestFields``.
 #
 # The defaults below document each option for ``--help`` and for the generated
 # sample .env; they are not applied at runtime. Options register with

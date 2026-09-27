@@ -17,8 +17,11 @@ which broke document ingestion outright. Bedrock now goes through
 ``argparse.SUPPRESS``, so one the operator never set is absent from the
 Namespace, absent from ``options_dict()``, and absent from the request.
 
-These tests pin both halves -- that an unset option never materialises, and
-that the driver only forwards what it was actually given.
+These tests pin all three layers the value passes through: that an unset
+option never materialises in ``options_dict()``, that the driver forwards only
+what it was given, and -- at ``bedrock_model_complete``, the function that
+carried the bug -- that a Bedrock-configured server issues a request with no
+inference parameters it was not asked for.
 """
 
 import sys
@@ -75,11 +78,14 @@ def _options_dict(monkeypatch, **env):
 
 @pytest.mark.offline
 def test_unset_options_are_absent_not_defaulted(monkeypatch):
-    """The regression: no configuration means no inference parameters at all.
+    """The options layer: no configuration yields no options at all.
 
     ``BedrockLLMOptions.temperature`` defaults to ``DEFAULT_TEMPERATURE`` so the
     value can be documented in ``--help`` and the generated sample .env. That
-    default must never reach a request.
+    default must never become an option.
+
+    This is one layer below where the bug lived; see
+    ``test_server_sends_no_inference_config_when_unconfigured`` for the server.
     """
     assert _options_dict(monkeypatch) == {}
 
@@ -114,7 +120,11 @@ async def test_no_inference_config_when_nothing_is_supplied(fake_client):
 
 @pytest.mark.offline
 async def test_none_valued_parameters_are_dropped(fake_client):
-    """``max_tokens=None`` means "inherit the provider default", not "send null"."""
+    """``max_tokens=None`` means "inherit the provider default", not "send null".
+
+    Reachable only from direct API callers: an unset variable yields no option
+    at all, and an empty one fails argparse type conversion before this runs.
+    """
     await bedrock_complete_if_cache(
         "us.openai.gpt-5.6-luna", "hi", max_tokens=None, temperature=0.2
     )
@@ -148,7 +158,7 @@ async def test_extra_fields_become_additional_model_request_fields(fake_client):
     Without the pass-through it would survive into ``converse(**kwargs)`` and
     botocore would reject the call.
     """
-    reasoning = {"reasoningConfig": {"type": "enabled"}}
+    reasoning = {"reasoning_config": {"type": "enabled"}}
     await bedrock_complete_if_cache(
         "us.anthropic.claude-sonnet-4-6", "hi", extra_fields=reasoning
     )
@@ -158,7 +168,7 @@ async def test_extra_fields_become_additional_model_request_fields(fake_client):
     assert "extra_fields" not in sent
 
 
-# The server-side half: the closure ``create_app`` actually builds. Patching
+# The server layer: the closure ``create_app`` actually builds. Patching
 # ``LightRAG`` lets ``_build_rag`` run without any storage backend, and the
 # function it was handed is the one the server would call per completion --
 # the same technique ``tests/test_path_prefixes.py`` uses to exercise
