@@ -21,7 +21,9 @@ These tests pin both halves -- that an unset option never materialises, and
 that the driver only forwards what it was actually given.
 """
 
+import sys
 from argparse import ArgumentParser
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -44,8 +46,9 @@ _BEDROCK_ENV_VARS = (
 def fake_client(monkeypatch):
     """Local copy of the token-tracker suite's fixture.
 
-    Fixtures are not shared between test modules, only through conftest, and
-    the Converse fake is not worth promoting there for two callers.
+    It could be shared through ``tests/conftest.py``, but that file is imported
+    for every test in the suite, and hoisting this would put ``aioboto3`` --
+    which only these two modules need -- on the import path of all of them.
     """
     client = _FakeBedrockClient()
     monkeypatch.setattr(
@@ -155,18 +158,93 @@ async def test_extra_fields_become_additional_model_request_fields(fake_client):
     assert "extra_fields" not in sent
 
 
+# The server-side half: the closure ``create_app`` actually builds. Patching
+# ``LightRAG`` lets ``_build_rag`` run without any storage backend, and the
+# function it was handed is the one the server would call per completion --
+# the same technique ``tests/test_path_prefixes.py`` uses to exercise
+# ``create_app`` offline.
+_SERVER_ENV_TO_ISOLATE = (
+    "LLM_BINDING",
+    "LLM_MODEL",
+    "LLM_BINDING_HOST",
+    "LLM_BINDING_API_KEY",
+    "EMBEDDING_BINDING",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_BINDING_HOST",
+    "EMBEDDING_BINDING_API_KEY",
+    "LIGHTRAG_KV_STORAGE",
+    "LIGHTRAG_VECTOR_STORAGE",
+    "LIGHTRAG_GRAPH_STORAGE",
+    "LIGHTRAG_DOC_STATUS_STORAGE",
+)
+
+
+def _bedrock_model_complete(monkeypatch, **env):
+    """Return the Bedrock completion function a Bedrock-configured server builds."""
+    for name in _SERVER_ENV_TO_ISOLATE + _BEDROCK_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LLM_BINDING", "aws_bedrock")
+    monkeypatch.setenv("LLM_MODEL", "us.openai.gpt-5.6-luna")
+    monkeypatch.setenv("EMBEDDING_BINDING", "aws_bedrock")
+    monkeypatch.setenv("EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(sys, "argv", ["lightrag-server"])
+
+    from lightrag.api.config import parse_args
+    from lightrag.api.lightrag_server import create_app
+
+    args = parse_args()
+    with patch("lightrag.api.lightrag_server.LightRAG") as rag:
+        rag.return_value = MagicMock()
+        create_app(args)
+
+    return rag.call_args.kwargs["llm_model_func"]
+
+
 @pytest.mark.offline
-async def test_server_options_are_overridable_by_the_caller(monkeypatch):
-    """The server merge is ``{**options, **kwargs}`` -- an explicit call wins."""
-    client = _FakeBedrockClient()
-    monkeypatch.setattr(
-        bedrock_module.aioboto3, "Session", lambda: _FakeSession(client)
-    )
-    options = _options_dict(monkeypatch, BEDROCK_LLM_TEMPERATURE="0.3")
+async def test_server_sends_no_inference_config_when_unconfigured(
+    monkeypatch, fake_client
+):
+    """The regression, at the line that caused it.
 
-    await bedrock_complete_if_cache(
-        "us.anthropic.claude-sonnet-4-6", "hi", **{**options, "temperature": 0.9}
+    A Bedrock server with no inference options configured must issue a Converse
+    request carrying no ``inferenceConfig`` at all. Re-adding a manufactured
+    temperature to ``bedrock_model_complete`` fails here and nowhere else.
+    """
+    complete = _bedrock_model_complete(monkeypatch)
+
+    assert await complete("hi") == "hello"
+
+    ((_, sent),) = fake_client.calls
+    assert "inferenceConfig" not in sent
+
+
+@pytest.mark.offline
+async def test_server_applies_configured_options(monkeypatch, fake_client):
+    """Configuration still reaches the request -- the knob is not merely removed."""
+    complete = _bedrock_model_complete(
+        monkeypatch, BEDROCK_LLM_TEMPERATURE="0.4", BEDROCK_LLM_MAX_TOKENS="256"
     )
 
-    ((_, sent),) = client.calls
+    await complete("hi")
+
+    ((_, sent),) = fake_client.calls
+    assert sent["inferenceConfig"] == {"temperature": 0.4, "maxTokens": 256}
+
+
+@pytest.mark.offline
+async def test_server_configuration_is_overridable_by_the_caller(
+    monkeypatch, fake_client
+):
+    """``{**options, **kwargs}`` -- an explicit argument beats server config.
+
+    Deliberately the opposite of the OpenAI path, which applies its options with
+    ``kwargs.update()``. Switching the merge order fails here.
+    """
+    complete = _bedrock_model_complete(monkeypatch, BEDROCK_LLM_TEMPERATURE="0.4")
+
+    await complete("hi", temperature=0.9)
+
+    ((_, sent),) = fake_client.calls
     assert sent["inferenceConfig"] == {"temperature": 0.9}

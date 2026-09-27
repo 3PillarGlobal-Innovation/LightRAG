@@ -1133,7 +1133,11 @@ def create_app(args):
         # unset option is absent from the Namespace (argparse.SUPPRESS), so it
         # never reaches the Converse request -- reasoning-tier models reject
         # inferenceConfig fields such as temperature rather than ignoring them.
-        # Caller-supplied kwargs win over the server-wide configuration.
+        # Caller-supplied kwargs win over the server-wide configuration -- the
+        # opposite of create_optimized_openai_llm_func, which applies its options
+        # with kwargs.update() and so lets the server override the caller. This
+        # follows the upstream Bedrock path; no core call site passes any of these
+        # keys today, so the two orderings are observationally identical for now.
         if config_cache.bedrock_llm_options:
             kwargs = {**config_cache.bedrock_llm_options, **kwargs}
 

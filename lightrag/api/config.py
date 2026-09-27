@@ -362,7 +362,8 @@ def parse_args() -> argparse.Namespace:
         help="Enable DOCLING document loading engine (default: from env or DEFAULT)",
     )
 
-    # Conditionally add binding-specific options (Ollama, OpenAI, Azure OpenAI, Gemini)
+    # Conditionally add binding-specific options (Ollama, OpenAI, Azure OpenAI,
+    # Gemini, AWS Bedrock)
     # This registers command line arguments (e.g., --openai-llm-temperature)
     # and reads corresponding environment variables (e.g., OPENAI_LLM_TEMPERATURE)
 
