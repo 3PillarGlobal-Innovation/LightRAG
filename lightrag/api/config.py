@@ -9,6 +9,7 @@ import logging
 from dotenv import load_dotenv
 from lightrag.utils import get_env_value, logger
 from lightrag.llm.binding_options import (
+    BedrockLLMOptions,
     GeminiEmbeddingOptions,
     GeminiLLMOptions,
     OllamaEmbeddingOptions,
@@ -386,6 +387,8 @@ def parse_args() -> argparse.Namespace:
         OpenAILLMOptions.add_args(parser)
     elif llm_binding_value == "gemini":
         GeminiLLMOptions.add_args(parser)
+    elif llm_binding_value == "aws_bedrock":
+        BedrockLLMOptions.add_args(parser)
 
     # Determine embedding binding value consistently from command line or environment
     embedding_binding_value = None
