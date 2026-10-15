@@ -189,7 +189,9 @@ class TokenUsageResponse(BaseModel):
     )
 
 
-def _build_token_usage_response(result: Dict[str, Any]) -> Optional["TokenUsageResponse"]:
+def _build_token_usage_response(
+    result: Dict[str, Any],
+) -> Optional["TokenUsageResponse"]:
     """Shape aquery_llm's flat token_usage / embedding_token_usage dicts into
     the response model the backend's cost logger expects.
 
@@ -509,7 +511,9 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
             query_cache = result.get("query_cache") or {}
             cache_fields = {
                 "cached": bool(query_cache.get("hit")),
-                "cached_at": query_cache.get("cached_at") if query_cache.get("hit") else None,
+                "cached_at": query_cache.get("cached_at")
+                if query_cache.get("hit")
+                else None,
             }
 
             # Get the non-streaming response content
@@ -832,7 +836,9 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                         result.update(refresh_token_usage())
                     token_usage = _build_token_usage_response(result)
                     token_usage_dump = (
-                        token_usage.model_dump(exclude_none=True) if token_usage else None
+                        token_usage.model_dump(exclude_none=True)
+                        if token_usage
+                        else None
                     )
 
                     # Emit token usage as the final NDJSON frame so streaming
@@ -851,7 +857,9 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
 
                     token_usage = _build_token_usage_response(result)
                     token_usage_dump = (
-                        token_usage.model_dump(exclude_none=True) if token_usage else None
+                        token_usage.model_dump(exclude_none=True)
+                        if token_usage
+                        else None
                     )
 
                     # Create complete response object

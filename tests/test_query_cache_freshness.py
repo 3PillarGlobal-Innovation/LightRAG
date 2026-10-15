@@ -15,6 +15,9 @@ from lightrag.base import QueryParam
 from lightrag.operate import _note_query_cache, _usable_query_cache
 from lightrag.utils import CacheData, handle_cache, save_to_cache
 
+# Run by the offline CI job (`pytest -m offline`): no network, no real LLM or storage.
+pytestmark = pytest.mark.offline
+
 
 class FakeKV:
     """The two calls the cache helpers make, with the timestamp rules of the JSON store."""
@@ -22,7 +25,10 @@ class FakeKV:
     def __init__(self, now=1000):
         self.data = {}
         self.now = now
-        self.global_config = {"enable_llm_cache": True, "enable_llm_cache_for_entity_extract": True}
+        self.global_config = {
+            "enable_llm_cache": True,
+            "enable_llm_cache_for_entity_extract": True,
+        }
 
     async def get_by_id(self, key):
         entry = self.data.get(key)
@@ -42,7 +48,9 @@ class FakeKV:
 
 
 def _query_entry(content="answer"):
-    return CacheData(args_hash="h1", content=content, prompt="q", mode="mix", cache_type="query")
+    return CacheData(
+        args_hash="h1", content=content, prompt="q", mode="mix", cache_type="query"
+    )
 
 
 class TestUsableQueryCache:
@@ -53,7 +61,10 @@ class TestUsableQueryCache:
         assert _usable_query_cache(("a", 5), QueryParam(cache_valid_after=6)) is None
 
     def test_an_answer_written_after_the_cutoff_is_used(self):
-        assert _usable_query_cache(("a", 7), QueryParam(cache_valid_after=6)) == ("a", 7)
+        assert _usable_query_cache(("a", 7), QueryParam(cache_valid_after=6)) == (
+            "a",
+            7,
+        )
 
     def test_a_miss_stays_a_miss(self):
         assert _usable_query_cache(None, QueryParam(cache_valid_after=6)) is None
@@ -67,7 +78,9 @@ class TestCacheTimestamps:
         kv.now = 200
         await save_to_cache(kv, _query_entry("new"))
 
-        content, written_at = await handle_cache(kv, "h1", "q", "mix", cache_type="query")
+        content, written_at = await handle_cache(
+            kv, "h1", "q", "mix", cache_type="query"
+        )
 
         # The overwrite dropped create_time; update_time is the moment that counts.
         assert (content, written_at) == ("new", 200)
@@ -82,12 +95,21 @@ class TestCacheTimestamps:
 
         _, written_at = await handle_cache(kv, "h1", "q", "mix", cache_type="query")
         assert written_at == 300
-        assert _usable_query_cache(("same", written_at), QueryParam(cache_valid_after=250)) is not None
+        assert (
+            _usable_query_cache(("same", written_at), QueryParam(cache_valid_after=250))
+            is not None
+        )
 
     @pytest.mark.asyncio
     async def test_an_unchanged_extraction_result_is_not_rewritten(self):
         kv = FakeKV(now=100)
-        extraction = CacheData(args_hash="e1", content="x", prompt="p", mode="default", cache_type="extract")
+        extraction = CacheData(
+            args_hash="e1",
+            content="x",
+            prompt="p",
+            mode="default",
+            cache_type="extract",
+        )
         await save_to_cache(kv, extraction)
         kv.now = 300
         await save_to_cache(kv, extraction)
@@ -121,11 +143,16 @@ class FakeChunks:
     cosine_better_than_threshold = 0.2
 
     async def query(self, query, top_k, query_embedding=None):
-        return [{
-            "id": "chunk-1", "content": "Refunds are accepted within 45 days of delivery.",
-            "file_path": "Refund Window.md", "full_doc_id": "doc-1", "distance": 0.9,
-            "created_at": 1,
-        }]
+        return [
+            {
+                "id": "chunk-1",
+                "content": "Refunds are accepted within 45 days of delivery.",
+                "file_path": "Refund Window.md",
+                "full_doc_id": "doc-1",
+                "distance": 0.9,
+                "created_at": 1,
+            }
+        ]
 
 
 class FakeTokenizer:
@@ -165,7 +192,9 @@ async def test_naive_query_reuses_its_cache_and_regenerates_after_the_cutoff():
 
     def ask(cutoff=None):
         param = QueryParam(mode="naive", enable_rerank=False, cache_valid_after=cutoff)
-        return naive_query("refund window?", FakeChunks(), param, global_config, hashing_kv=kv)
+        return naive_query(
+            "refund window?", FakeChunks(), param, global_config, hashing_kv=kv
+        )
 
     first = await ask()
     assert (first.content, first.raw_data["query_cache"]["hit"]) == ("answer 1", False)
@@ -208,10 +237,19 @@ async def test_the_query_route_passes_the_cutoff_and_reports_the_cache_hit(monke
     app = FastAPI()
     app.include_router(create_query_routes(get_rag))
     response = TestClient(app).post(
-        "/query", json={"query": "refund window?", "mode": "naive", "cache_valid_after": 1760526125.5},
+        "/query",
+        json={
+            "query": "refund window?",
+            "mode": "naive",
+            "cache_valid_after": 1760526125.5,
+        },
     )
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert (body["response"], body["cached"], body["cached_at"]) == ("45 days", True, 1000)
+    assert (body["response"], body["cached"], body["cached_at"]) == (
+        "45 days",
+        True,
+        1000,
+    )
     assert seen["cache_valid_after"] == 1760526125.5
