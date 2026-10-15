@@ -162,6 +162,12 @@ class QueryParam:
     Default is True to enable reranking when rerank model is available.
     """
 
+    cache_valid_after: float | None = None
+    """Unix time. A cached query answer last written before this is ignored and regenerated.
+    Pass the time the workspace's documents last changed, so a repeated question is not
+    answered from documents that are no longer indexed. Not part of the cache key.
+    """
+
     include_references: bool = False
     """If True, includes reference list in the response for supported endpoints.
     This parameter controls whether the API response includes a references field
