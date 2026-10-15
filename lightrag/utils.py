@@ -1481,7 +1481,9 @@ async def handle_cache(
     """Generic cache handling function with flattened cache keys
 
     Returns:
-        tuple[str, int] | None: (content, create_time) if cache hit, None if cache miss
+        tuple[str, int] | None: (content, time last written) if cache hit, None if cache miss.
+        The time is ``update_time``, falling back to ``create_time``: storages reset
+        ``create_time`` when an entry is overwritten and refresh ``update_time``.
     """
     if hashing_kv is None:
         return None
@@ -1499,7 +1501,7 @@ async def handle_cache(
     if cache_entry:
         logger.debug(f"Flattened cache hit(key:{flattened_key})")
         content = cache_entry["return"]
-        timestamp = cache_entry.get("create_time", 0)
+        timestamp = cache_entry.get("update_time") or cache_entry.get("create_time", 0)
         return content, timestamp
 
     logger.debug(f"Cache missed(mode:{mode} type:{cache_type})")
@@ -1543,6 +1545,12 @@ async def save_to_cache(hashing_kv, cache_data: CacheData):
     if existing_cache:
         existing_content = existing_cache.get("return")
         if existing_content == cache_data.content:
+            if cache_data.cache_type == "query":
+                # A query answer regenerated because it predated cache_valid_after
+                # came out the same. Rewrite it so its update_time moves forward;
+                # otherwise it stays "too old" and every later ask regenerates it.
+                await hashing_kv.upsert({flattened_key: existing_cache})
+                return
             logger.warning(
                 f"Cache duplication detected for {flattened_key}, skipping update"
             )

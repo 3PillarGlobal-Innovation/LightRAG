@@ -108,6 +108,11 @@ class QueryRequest(BaseModel):
         description="If True, enables streaming output for real-time responses. Only affects /query/stream endpoint.",
     )
 
+    cache_valid_after: Optional[float] = Field(
+        default=None,
+        description="Unix time. A cached answer last written before this is ignored and regenerated. Pass the time the workspace's documents last changed.",
+    )
+
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:
@@ -184,7 +189,9 @@ class TokenUsageResponse(BaseModel):
     )
 
 
-def _build_token_usage_response(result: Dict[str, Any]) -> Optional["TokenUsageResponse"]:
+def _build_token_usage_response(
+    result: Dict[str, Any],
+) -> Optional["TokenUsageResponse"]:
     """Shape aquery_llm's flat token_usage / embedding_token_usage dicts into
     the response model the backend's cost logger expects.
 
@@ -228,6 +235,14 @@ class QueryResponse(BaseModel):
     token_usage: Optional[TokenUsageResponse] = Field(
         default=None,
         description="LLM + embedding token usage for cost calculation. None when tracking is unavailable for the request.",
+    )
+    cached: bool = Field(
+        default=False,
+        description="True when the answer was served from the query cache instead of being generated now.",
+    )
+    cached_at: Optional[int] = Field(
+        default=None,
+        description="Unix time the cached answer was written. Set only when cached is True.",
     )
 
 
@@ -493,6 +508,13 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
             data = result.get("data", {})
             references = data.get("references", [])
             token_usage = _build_token_usage_response(result)
+            query_cache = result.get("query_cache") or {}
+            cache_fields = {
+                "cached": bool(query_cache.get("hit")),
+                "cached_at": query_cache.get("cached_at")
+                if query_cache.get("hit")
+                else None,
+            }
 
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
@@ -528,12 +550,14 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                     response=response_content,
                     references=references,
                     token_usage=token_usage,
+                    **cache_fields,
                 )
             else:
                 return QueryResponse(
                     response=response_content,
                     references=None,
                     token_usage=token_usage,
+                    **cache_fields,
                 )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
@@ -812,7 +836,9 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
                         result.update(refresh_token_usage())
                     token_usage = _build_token_usage_response(result)
                     token_usage_dump = (
-                        token_usage.model_dump(exclude_none=True) if token_usage else None
+                        token_usage.model_dump(exclude_none=True)
+                        if token_usage
+                        else None
                     )
 
                     # Emit token usage as the final NDJSON frame so streaming
@@ -831,7 +857,9 @@ def create_query_routes(get_rag, api_key: Optional[str] = None, top_k: int = 60)
 
                     token_usage = _build_token_usage_response(result)
                     token_usage_dump = (
-                        token_usage.model_dump(exclude_none=True) if token_usage else None
+                        token_usage.model_dump(exclude_none=True)
+                        if token_usage
+                        else None
                     )
 
                     # Create complete response object
