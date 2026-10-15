@@ -3161,6 +3161,32 @@ async def extract_entities(
     return chunk_results
 
 
+def _usable_query_cache(
+    cached_result: tuple[str, int] | None, query_param: QueryParam
+) -> tuple[str, int] | None:
+    """Drop a cached answer that is older than ``query_param.cache_valid_after``.
+
+    A query answer is cached under its question and parameters only, so once
+    the documents behind it change, the same question keeps returning the old
+    answer. A caller that knows when its documents last changed passes that
+    time; an older cached answer is then regenerated (and re-cached) instead.
+    """
+    if cached_result is None or query_param.cache_valid_after is None:
+        return cached_result
+    if cached_result[1] < query_param.cache_valid_after:
+        logger.info(
+            " == LLM cache == Query cache entry predates cache_valid_after, regenerating"
+        )
+        return None
+    return cached_result
+
+
+def _note_query_cache(raw_data: dict[str, Any] | None, cached_at: int | None) -> None:
+    """Record on the result whether the answer came from the query cache, and when it was cached."""
+    if raw_data is not None:
+        raw_data["query_cache"] = {"hit": cached_at is not None, "cached_at": cached_at}
+
+
 async def kg_query(
     query: str,
     knowledge_graph_inst: BaseGraphStorage,
@@ -3302,12 +3328,15 @@ async def kg_query(
         query_param.enable_rerank,
     )
 
-    cached_result = await handle_cache(
-        hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+    cached_result = _usable_query_cache(
+        await handle_cache(
+            hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+        ),
+        query_param,
     )
-
+    cached_at = cached_result[1] if cached_result is not None else None
     if cached_result is not None:
-        cached_response, _ = cached_result  # Extract content, ignore timestamp
+        cached_response, _ = cached_result
         logger.info(
             " == LLM cache == Query cache hit, using cached response as query result"
         )
@@ -3346,6 +3375,8 @@ async def kg_query(
                     queryparam=queryparam_dict,
                 ),
             )
+
+    _note_query_cache(context_result.raw_data, cached_at)
 
     # Return unified result based on actual response type
     if isinstance(response, str):
@@ -5132,11 +5163,15 @@ async def naive_query(
         query_param.user_prompt or "",
         query_param.enable_rerank,
     )
-    cached_result = await handle_cache(
-        hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+    cached_result = _usable_query_cache(
+        await handle_cache(
+            hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+        ),
+        query_param,
     )
+    cached_at = cached_result[1] if cached_result is not None else None
     if cached_result is not None:
-        cached_response, _ = cached_result  # Extract content, ignore timestamp
+        cached_response, _ = cached_result
         logger.info(
             " == LLM cache == Query cache hit, using cached response as query result"
         )
@@ -5173,6 +5208,8 @@ async def naive_query(
                     queryparam=queryparam_dict,
                 ),
             )
+
+    _note_query_cache(raw_data, cached_at)
 
     # Return unified result based on actual response type
     if isinstance(response, str):
